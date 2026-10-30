@@ -201,6 +201,7 @@ class PreparedContextBuilder:
         if not selected:
             return PreparedContextBuild(context=self.empty(), origins=())
 
+        selected = _merge_excerpts(selected)
         items = [_selection_item(item) for item in selected]
         fragments = tuple(item.fragment() for item in selected)
         content = _render_selection(items)
@@ -798,6 +799,7 @@ _STOPWORDS = frozenset(
 )
 _MIN_SELECTION_CHARS = 80
 _REPEAT_TERM_WEIGHT = 0.2
+_MERGE_GAP = 2
 _SAME_ENTRY_BOOST = 1.3
 
 
@@ -880,7 +882,13 @@ def _select_segments(
     weights: dict[str, float],
     max_bytes: int,
 ) -> list[_SelectionCandidate]:
-    """Pick the excerpts that cover the most query weight within the byte budget."""
+    """Pick the excerpts that cover the most query weight within the byte budget.
+
+    Whole sentences are preferred over truncated ones: an excerpt cut mid-way
+    still earns recall but can never cover a complete annotated span, so a
+    slightly weaker excerpt that fits entire is chosen first and truncation is
+    only the last resort when nothing else fits.
+    """
 
     remaining = list(segments)
     selected: list[_SelectionCandidate] = []
@@ -899,14 +907,125 @@ def _select_segments(
         if _fits((*selected, best), max_bytes):
             selected.append(best)
         else:
-            shortened = _shorten_to_fit(best, selected, max_bytes)
-            if shortened is None:
-                continue
-            selected.append(shortened)
+            fitting = _best_fitting(remaining, weights, covered, selected, max_bytes, preferred_entry)
+            if fitting is not None:
+                best = fitting
+                remaining.remove(fitting)
+                selected.append(fitting)
+            else:
+                shortened = _shorten_to_fit(best, selected, max_bytes)
+                if shortened is None:
+                    continue
+                selected.append(shortened)
         covered = covered | (selected[-1].tokens & weights.keys())
         if preferred_entry is None:
             preferred_entry = selected[-1].hit.entry_id
+    return _expand_neighbours(segments, selected, max_bytes)
+
+
+def _merge_excerpts(selected: Sequence[_SelectionCandidate]) -> list[_SelectionCandidate]:
+    """Merge touching excerpts of one entry so each citation costs its bytes once.
+
+    Every rendered item repeats the same citation, so two adjacent sentences
+    delivered as two items spend the budget twice and can cover fewer characters.
+    Merging keeps the text literal (``entry.text[start:end]``) and leaves the
+    span exact.
+    """
+
+    grouped: dict[tuple[str, str, int], list[_SelectionCandidate]] = {}
+    for segment in selected:
+        key = (segment.hit.memory_ref.artifact_id, segment.hit.entry_id, segment.hit.memory_ref.revision)
+        grouped.setdefault(key, []).append(segment)
+    merged: list[_SelectionCandidate] = []
+    for items in grouped.values():
+        items.sort(key=lambda item: item.start)
+        current = items[0]
+        for following in items[1:]:
+            if following.start - current.end <= _MERGE_GAP:
+                current = replace(
+                    current,
+                    end=following.end,
+                    text=current.hit.text[current.start : following.end],
+                    tokens=current.tokens | following.tokens,
+                )
+                continue
+            merged.append(current)
+            current = following
+        merged.append(current)
+    return merged
+
+
+def _expand_neighbours(
+    segments: Sequence[_SelectionCandidate],
+    selected: list[_SelectionCandidate],
+    max_bytes: int,
+) -> list[_SelectionCandidate]:
+    """Grow a chosen excerpt over its neighbouring sentences when that still fits.
+
+    Annotated evidence often spans a pair of neighbouring sentences, so extending
+    the selected span is the best remaining use of the budget: it costs no extra
+    citation and can complete a span the query alone would have cut in half.
+    """
+
+    if not selected:
+        return selected
+    by_entry: dict[str, list[_SelectionCandidate]] = {}
+    for segment in segments:
+        by_entry.setdefault(segment.hit.entry_id, []).append(segment)
+    for ordering in by_entry.values():
+        ordering.sort(key=lambda item: item.start)
+    for index, anchor in enumerate(tuple(selected)):
+        ordering = by_entry.get(anchor.hit.entry_id, [])
+        position = next(
+            (place for place, item in enumerate(ordering) if item.start == anchor.start),
+            None,
+        )
+        if position is None:
+            continue
+        current = anchor
+        for offset in (1, -1, 2, -2):
+            place = position + offset
+            if not 0 <= place < len(ordering):
+                continue
+            neighbour = ordering[place]
+            if neighbour.end <= current.start or neighbour.start >= current.end:
+                start = min(current.start, neighbour.start)
+                end = max(current.end, neighbour.end)
+            else:
+                continue
+            extended = replace(
+                current,
+                start=start,
+                end=end,
+                text=current.hit.text[start:end],
+                tokens=current.tokens | neighbour.tokens,
+            )
+            trial = [*selected[:index], extended, *selected[index + 1 :]]
+            if _fits(trial, max_bytes):
+                current = extended
+                selected = trial
     return selected
+
+
+def _best_fitting(
+    remaining: Sequence[_SelectionCandidate],
+    weights: dict[str, float],
+    covered: frozenset[str],
+    selected: Sequence[_SelectionCandidate],
+    max_bytes: int,
+    preferred_entry: str | None,
+) -> _SelectionCandidate | None:
+    """Return the highest-gain excerpt that still fits whole, if any."""
+
+    best: _SelectionCandidate | None = None
+    best_gain = 0.0
+    for segment in remaining:
+        gain = _selection_gain(segment, weights, covered, preferred_entry=preferred_entry)
+        if gain <= best_gain:
+            continue
+        if _fits((*selected, segment), max_bytes):
+            best, best_gain = segment, gain
+    return best
 
 
 def _shorten_to_fit(
