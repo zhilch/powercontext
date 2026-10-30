@@ -21,6 +21,7 @@ import io
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field
@@ -177,11 +178,12 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
     """Return up to the requested number of distinct page citations for one question.
 
     A natural-language question mixes the evidence request with instructions and
-    filler, and filings phrase the same fact with different words than the caller
-    does. Each stored page is therefore scored under several query readings —
-    literal, domain-vocabulary expanded, and instruction-stripped with repeated
-    terms counted — and the readings are fused by reciprocal rank. Only the
-    public Memory read path is used, and every citation is the exact entry
+    filler, and a filing phrases the same fact with different words than the
+    caller does. Every stored page is therefore scored twice — once on the
+    expanded question and once on the instruction-free question with repeated
+    terms counted — by BM25 over the page body plus a stronger weight on the
+    page's title region, and the two rankings are fused by reciprocal rank. Only
+    the public Memory read path is used, and every citation is the exact entry
     version the ranking read.
     """
 
@@ -197,9 +199,10 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
     records = await _stored_pages(memory)
     if not records:
         return ()
+    analyzed = [_analyze(str(record.entry.text)) for record in records]
     fused: dict[int, float] = {}
     for terms, repetitions in readings:
-        for rank, index in enumerate(_rank_pages(records, terms, repetitions), start=1):
+        for rank, index in enumerate(_rank_pages(analyzed, terms, repetitions), start=1):
             if rank > _FUSION_DEPTH:
                 break
             fused[index] = fused.get(index, 0.0) + 1.0 / (_FUSION_RRF_CONSTANT + rank)
@@ -225,8 +228,8 @@ _STOPWORDS = frozenset(
     which while who whom why will with would you your yours yourself yourselves
     """.split()
 )
-# Generic filing vocabulary: questions speak analyst language, filings name line
-# items. Expansions are added to one reading only, at a lower weight.
+# Generic filing vocabulary: a question speaks analyst language while a filing
+# names line items and statements. One reading adds these, the other does not.
 _EXPANSIONS = {
     "battles": ("litigation", "proceedings"),
     "battle": ("litigation", "proceedings"),
@@ -238,6 +241,9 @@ _EXPANSIONS = {
     "revenue": ("sales",),
     "restructuring": ("severance", "charges"),
     "margin": ("income",),
+    "liquidity": ("balance", "current"),
+    "liability": ("balance",),
+    "liabilities": ("balance",),
 }
 _INSTRUCTION = re.compile(
     r"^\s*(?:respond|answer|give|assume|provide|please|use |using |rely|relying|calculate|compute|"
@@ -246,22 +252,44 @@ _INSTRUCTION = re.compile(
 )
 _BM25_K1 = 1.2
 _BM25_B = 0.75
-_EXPANSION_WEIGHT = 0.5
 _REPETITION_WEIGHT = 0.5
+_HEADING_WEIGHT = 3.0
+_HEADING_LINES = 3
 _FUSION_DEPTH = 100
 _FUSION_RRF_CONSTANT = 60
+
+
+def _analyze(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the page body tokens and its title-region tokens."""
+
+    return tuple(_TOKEN.findall(text.lower())), tuple(_TOKEN.findall(_heading_text(text).lower()))
+
+
+def _heading_text(text: str) -> str:
+    """Return the leading lines plus the standalone uppercase headings of a page."""
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    picked = lines[:_HEADING_LINES]
+    for line in lines:
+        letters = [character for character in line if character.isalpha()]
+        if not letters:
+            continue
+        uppercase = sum(1 for character in letters if character.isupper()) / len(letters)
+        if uppercase >= 0.7 and len(line) <= 90:
+            picked.append(line)
+    return "\n".join(picked)
 
 
 def _query_readings(question: str) -> tuple[tuple[tuple[str, ...], dict[str, float]], ...]:
     """Return the query readings whose rankings are fused for one question."""
 
-    literal = _question_terms(question)
+    literal = _expanded_terms(question)
     if not literal:
         return ()
+    stripped = _expanded_terms(question, strip_instructions=True)
     return (
-        (literal, {term: 1.0 for term in dict.fromkeys(literal)}),
-        (_expanded_terms(question), _repetition_weights(question)),
-        (_expanded_terms(question, strip_instructions=True), _repetition_weights(question, strip=True)),
+        (literal, {term: 1.0 for term in literal}),
+        (stripped, _repetition_weights(question)),
     )
 
 
@@ -275,16 +303,30 @@ def _question_terms(question: str, *, strip_instructions: bool = False) -> tuple
     return tuple(dict.fromkeys(term for term in _TOKEN.findall(text.lower()) if term not in _STOPWORDS))
 
 
+def _plural_variants(term: str) -> tuple[str, ...]:
+    """Return the regular plural of a term so page headings match singular asks."""
+
+    if term.isdigit() or len(term) < 3:
+        return ()
+    if term.endswith("y"):
+        return (term[:-1] + "ies",)
+    if term.endswith(("s", "x", "ch", "sh")):
+        return (term + "es",)
+    return (term + "s",)
+
+
 def _expanded_terms(question: str, *, strip_instructions: bool = False) -> tuple[str, ...]:
     terms = _question_terms(question, strip_instructions=strip_instructions)
     extra: list[str] = []
     for term in terms:
         extra.extend(_EXPANSIONS.get(term, ()))
+    for term in (*terms, *extra):
+        extra.extend(_plural_variants(term))
     return tuple(dict.fromkeys((*terms, *extra)))
 
 
-def _repetition_weights(question: str, *, strip: bool = False) -> dict[str, float]:
-    counts = Counter(_question_terms(question, strip_instructions=strip))
+def _repetition_weights(question: str) -> dict[str, float]:
+    counts = Counter(_question_terms(question))
     return {term: 1.0 + _REPETITION_WEIGHT * count for term, count in counts.items()}
 
 
@@ -296,17 +338,17 @@ async def _stored_pages(memory: object) -> tuple[object, ...]:
 
 
 def _rank_pages(
-    records: tuple[object, ...],
+    analyzed: Sequence[tuple[tuple[str, ...], tuple[str, ...]]],
     terms: tuple[str, ...],
     repetitions: dict[str, float],
 ) -> list[int]:
-    """Rank page indexes by BM25 over the whole stored corpus."""
+    """Rank page indexes by BM25 over the corpus body and title regions."""
 
-    analyzed = [_TOKEN.findall(str(record.entry.text).lower()) for record in records]
     document_frequency: dict[str, int] = dict.fromkeys(terms, 0)
-    for tokens in analyzed:
-        for term in set(tokens).intersection(document_frequency):
-            document_frequency[term] += 1
+    for body, heading in analyzed:
+        for term in set(body) | set(heading):
+            if term in document_frequency:
+                document_frequency[term] += 1
     total = len(analyzed)
     weights = {
         term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5)) * repetitions.get(term, 1.0)
@@ -314,25 +356,34 @@ def _rank_pages(
         if frequency
     }
     if not weights:
-        return list(range(len(analyzed)))
-    average_length = sum(len(tokens) for tokens in analyzed) / total
+        return list(range(total))
+    average_body = sum(len(body) for body, _heading in analyzed) / total
+    average_heading = max(1.0, sum(len(heading) for _body, heading in analyzed) / total)
     scored: list[tuple[float, int]] = []
-    for index, tokens in enumerate(analyzed):
-        counts: dict[str, int] = {}
-        for token in tokens:
-            if token in weights:
-                counts[token] = counts.get(token, 0) + 1
-        score = 0.0
-        if counts:
-            length = len(tokens)
-            normalization = _BM25_K1 * (1 - _BM25_B + _BM25_B * length / average_length)
-            score = sum(
-                weights[term] * count * (_BM25_K1 + 1) / (count + normalization)
-                for term, count in counts.items()
-            )
+    for index, (body, heading) in enumerate(analyzed):
+        score = _bm25(_counts(body, weights), weights, len(body), average_body)
+        if heading:
+            score += _HEADING_WEIGHT * _bm25(_counts(heading, weights), weights, len(heading), average_heading)
         scored.append((-score, index))
     scored.sort()
     return [index for _score, index in scored]
+
+
+def _counts(tokens: Sequence[str], weights: dict[str, float]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for token in tokens:
+        if token in weights:
+            counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def _bm25(counts: dict[str, int], weights: dict[str, float], length: int, average_length: float) -> float:
+    if not counts:
+        return 0.0
+    normalization = _BM25_K1 * (1 - _BM25_B + _BM25_B * length / max(average_length, 1.0))
+    return sum(
+        weights[term] * count * (_BM25_K1 + 1) / (count + normalization) for term, count in counts.items()
+    )
 
 __all__ = [
     "PDF_PAGE_SOURCE_DEFINITION",
