@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
+import re
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field
@@ -171,7 +173,15 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 
 
 async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tuple[object, ...]:
-    """Return up to the requested number of distinct page citations for one question."""
+    """Return up to the requested number of distinct page citations for one question.
+
+    A natural-language question carries instructions and filler that a lexical
+    index also matches, so the raw query alone ranks pages by the wrong words.
+    The candidates are therefore collected twice — once from the question and
+    once from the terms that are actually rare inside that candidate pool — and
+    then re-ranked by how much distinctive question evidence each page carries.
+    """
+
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
     from powercontext.builtin.runtime import SearchMemoryRequest
 
@@ -179,13 +189,16 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
         raise ValueError("question must be a non-empty string")
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
-    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=max(limit * 4, 40)))
+    terms = _question_terms(question)
+    hits: dict[str, object] = {}
+    await _collect_pages(memory, SearchMemoryRequest, question, _CANDIDATE_LIMIT, hits)
+    weights = _term_weights(hits, terms)
+    focused = _focused_query(terms, weights)
+    if focused:
+        await _collect_pages(memory, SearchMemoryRequest, focused, _CANDIDATE_LIMIT, hits)
+    ranked = _rank_pages(hits, weights)
     citations: list[MemoryCitation] = []
-    seen: set[str] = set()
-    for hit in page.hits:
-        if hit.entry_id in seen:
-            continue
-        seen.add(hit.entry_id)
+    for hit in ranked:
         citations.append(
             MemoryCitation(
                 memory_ref=hit.memory_ref,
@@ -196,6 +209,81 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
         if len(citations) >= limit:
             break
     return tuple(citations)
+
+
+_CANDIDATE_LIMIT = 200
+_FOCUSED_TERM_LIMIT = 8
+_TOKEN = re.compile(r"[a-z]+|\d+")
+_STOPWORDS = frozenset(
+    """
+    a about above after again against all also am an and any are as at be because been before being below between
+    both but by can could did do does doing down during each few for from further had has have having he her here
+    hers herself him himself his how i if in into is it its itself just me more most my myself no nor not now of
+    off on once only or other our ours ourselves out over own same she should so some such than that the their
+    theirs them themselves then there these they this those through to too under until up very was we were what
+    when where which while who whom why will with would you your yours yourself yourselves
+    """.split()
+)
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(term for term in _TOKEN.findall(question.lower()) if term not in _STOPWORDS))
+
+
+async def _collect_pages(
+    memory: object,
+    request_class: object,
+    query: str,
+    candidate_limit: int,
+    collected: dict[str, object],
+) -> None:
+    page = await memory.search(request_class(query=query, mode="fts", limit=candidate_limit))
+    for hit in page.hits:
+        collected.setdefault(hit.entry_id, hit)
+
+
+def _term_weights(hits: dict[str, object], terms: tuple[str, ...]) -> dict[str, float]:
+    """Weight question terms by how rarely they appear across the candidates."""
+
+    if not hits or not terms:
+        return {term: 1.0 for term in terms}
+    wanted = frozenset(terms)
+    frequency = dict.fromkeys(terms, 0)
+    for hit in hits.values():
+        tokens = frozenset(_TOKEN.findall(str(hit.text).lower()))
+        for term in tokens & wanted:
+            frequency[term] += 1
+    total = len(hits)
+    return {term: math.log((total + 1) / (frequency[term] + 1)) + 1.0 for term in terms}
+
+
+def _focused_query(terms: tuple[str, ...], weights: dict[str, float]) -> str:
+    """Return the rarest question terms, which identify the evidence pages."""
+
+    if not terms:
+        return ""
+    ordered = sorted(terms, key=lambda term: (-weights.get(term, 1.0), -len(term), term))
+    return " ".join(ordered[:_FOCUSED_TERM_LIMIT])
+
+
+def _rank_pages(hits: dict[str, object], weights: dict[str, float]) -> list[object]:
+    """Rank pages by distinct rare-term coverage, then by term density."""
+
+    if not hits:
+        return []
+    scored: list[tuple[float, int, int, object]] = []
+    for order, hit in enumerate(hits.values()):
+        tokens = _TOKEN.findall(str(hit.text).lower())
+        counts: dict[str, int] = {}
+        for token in tokens:
+            if token in weights:
+                counts[token] = counts.get(token, 0) + 1
+        coverage = sum(weights[term] for term in counts)
+        density = sum(weights[term] * min(count, 3) / 3 for term, count in counts.items())
+        score = (coverage + 0.25 * density) / (1.0 + 0.15 * math.log1p(len(tokens) / 100.0))
+        scored.append((-score, order, hit))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in scored]
 
 
 __all__ = [
