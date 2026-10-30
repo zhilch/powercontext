@@ -207,8 +207,9 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
             if rank > _FUSION_DEPTH:
                 break
             fused[index] = fused.get(index, 0.0) + 1.0 / (_FUSION_RRF_CONSTANT + rank)
+    fused = _with_document_identity(question, records, fused)
     ordered = sorted(fused, key=lambda index: (-fused[index], index))
-    ordered = _with_statement_pages(question, titles, ordered, limit)
+    ordered = _with_statement_pages(question, records, titles, ordered, limit)
     return tuple(
         MemoryCitation(
             memory_ref=records[index].memory_ref,
@@ -275,13 +276,32 @@ _STATEMENT_TITLE = re.compile(
     re.IGNORECASE,
 )
 _STATEMENT_RESERVE = 5
+_DOCUMENT_WEIGHT = 0.3
+_NAME_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 
-def _statement_indexes(titles: Sequence[str], limit: int) -> list[int]:
-    """Return the first page of each primary financial statement."""
+def _document_of(record: object) -> str:
+    """Return the document identity line a page entry carries."""
+
+    return str(record.entry.text).partition("\n")[0]
+
+
+def _statement_indexes(
+    titles: Sequence[str],
+    documents: Sequence[str],
+    document: str | None,
+    limit: int,
+) -> list[int]:
+    """Return the first page of each primary financial statement.
+
+    Only pages of ``document`` are considered: a scope may hold several filings,
+    and another filing's statement must not take a slot from this question.
+    """
 
     found: list[int] = []
     for index, title in enumerate(titles):
+        if document is not None and documents[index] != document:
+            continue
         if any(_STATEMENT_TITLE.match(line.strip()) for line in title.splitlines() if line.strip()):
             found.append(index)
         if len(found) >= limit:
@@ -289,17 +309,51 @@ def _statement_indexes(titles: Sequence[str], limit: int) -> list[int]:
     return found
 
 
+def _with_document_identity(
+    question: str,
+    records: Sequence[object],
+    fused: dict[int, float],
+) -> dict[int, float]:
+    """Nudge pages whose document the question names.
+
+    A scope may hold several filings, and only some of them are about the company
+    the question names. The document identity line that every page carries is the
+    only cross-document signal available; when the scope holds a single document
+    the bonus is constant and the ranking is unchanged.
+    """
+
+    names: dict[int, frozenset[str]] = {}
+    named = 0
+    for index, record in enumerate(records):
+        identity = str(record.entry.text).partition("\n")[0]
+        tokens = frozenset(token for token in _NAME_TOKEN.findall(identity.lower()) if len(token) >= 3)
+        names[index] = tokens
+        if tokens:
+            named += 1
+    if named < 2 or len({names[index] for index in names}) < 2:
+        return fused
+    asked = frozenset(_TOKEN.findall(question.lower()))
+    if not asked:
+        return fused
+    bonus = {index: _DOCUMENT_WEIGHT * len(tokens & asked) for index, tokens in names.items()}
+    if not any(bonus.values()):
+        return fused
+    return {index: score + bonus[index] for index, score in fused.items()}
+
+
 def _with_statement_pages(
     question: str,
+    records: Sequence[object],
     titles: Sequence[str],
     ordered: Sequence[int],
     limit: int,
 ) -> list[int]:
     """Reserve result slots for the primary statements a metric question needs."""
 
-    if not (_METRIC_WORDS & set(_TOKEN.findall(question.lower()))):
+    if not ordered or not (_METRIC_WORDS & set(_TOKEN.findall(question.lower()))):
         return list(ordered)
-    reserved = _statement_indexes(titles, _STATEMENT_RESERVE)
+    documents = [_document_of(record) for record in records]
+    reserved = _statement_indexes(titles, documents, documents[ordered[0]], _STATEMENT_RESERVE)
     if not reserved:
         return list(ordered)
     head = [index for index in ordered if index not in reserved][: max(limit - len(reserved), 0)]
