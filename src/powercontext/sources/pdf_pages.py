@@ -175,116 +175,92 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tuple[object, ...]:
     """Return up to the requested number of distinct page citations for one question.
 
-    A natural-language question carries instructions and filler that a lexical
-    index also matches, so the raw query alone ranks pages by the wrong words.
-    The candidates are therefore collected twice — once from the question and
-    once from the terms that are actually rare inside that candidate pool — and
-    then re-ranked by how much distinctive question evidence each page carries.
+    A natural-language question mixes the evidence request with instructions and
+    filler. Scoring every page against the whole corpus with BM25 keeps the
+    distinctive terms in charge and lets a definition sentence contribute its
+    vocabulary without letting one rare filler word decide the ranking. Only the
+    public Memory read path is used, and every citation is the exact entry
+    version the ranking read.
     """
 
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
-    from powercontext.builtin.runtime import SearchMemoryRequest
 
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
     terms = _question_terms(question)
-    hits: dict[str, object] = {}
-    await _collect_pages(memory, SearchMemoryRequest, question, _CANDIDATE_LIMIT, hits)
-    weights = _term_weights(hits, terms)
-    focused = _focused_query(terms, weights)
-    if focused:
-        await _collect_pages(memory, SearchMemoryRequest, focused, _CANDIDATE_LIMIT, hits)
-    ranked = _rank_pages(hits, weights)
-    citations: list[MemoryCitation] = []
-    for hit in ranked:
-        citations.append(
-            MemoryCitation(
-                memory_ref=hit.memory_ref,
-                entry_id=hit.entry_id,
-                entry_version_id=hit.entry_version_id,
-            )
+    if not terms:
+        return ()
+    records = await _stored_pages(memory)
+    if not records:
+        return ()
+    ranked = _rank_pages(records, terms)
+    return tuple(
+        MemoryCitation(
+            memory_ref=record.memory_ref,
+            entry_id=record.entry.entry_id,
+            entry_version_id=record.entry.entry_version_id,
         )
-        if len(citations) >= limit:
-            break
-    return tuple(citations)
+        for record in ranked[:limit]
+    )
 
 
-_CANDIDATE_LIMIT = 200
-_FOCUSED_TERM_LIMIT = 8
 _TOKEN = re.compile(r"[a-z]+|\d+")
 _STOPWORDS = frozenset(
     """
-    a about above after again against all also am an and any are as at be because been before being below between
-    both but by can could did do does doing down during each few for from further had has have having he her here
-    hers herself him himself his how i if in into is it its itself just me more most my myself no nor not now of
-    off on once only or other our ours ourselves out over own same she should so some such than that the their
-    theirs them themselves then there these they this those through to too under until up very was we were what
-    when where which while who whom why will with would you your yours yourself yourselves
+    about above after again against also am an and any are as at be because been before being below between both
+    but by can could did do does doing down during each few for from further had has have having he her here hers
+    herself him himself his how i if in into is it its itself just me more most my myself no nor not now of off on
+    once only or other our ours ourselves out over own same she should so some such than that the their theirs them
+    themselves then there these they this those through to too under until up very was we were what when where
+    which while who whom why will with would you your yours yourself yourselves
     """.split()
 )
+_BM25_K1 = 1.2
+_BM25_B = 0.75
+async def _stored_pages(memory: object) -> tuple[object, ...]:
+    """Read the current stored page entries through the public Memory read path."""
 
+    page = await memory.list()
+    return tuple(record for record in page.entries if record.entry.text.strip())
 
-def _question_terms(question: str) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(term for term in _TOKEN.findall(question.lower()) if term not in _STOPWORDS))
+def _rank_pages(records: tuple[object, ...], terms: tuple[str, ...]) -> list[object]:
+    """Rank page entries by BM25 over the whole stored corpus."""
 
-
-async def _collect_pages(
-    memory: object,
-    request_class: object,
-    query: str,
-    candidate_limit: int,
-    collected: dict[str, object],
-) -> None:
-    page = await memory.search(request_class(query=query, mode="fts", limit=candidate_limit))
-    for hit in page.hits:
-        collected.setdefault(hit.entry_id, hit)
-
-
-def _term_weights(hits: dict[str, object], terms: tuple[str, ...]) -> dict[str, float]:
-    """Weight question terms by how rarely they appear across the candidates."""
-
-    if not hits or not terms:
-        return {term: 1.0 for term in terms}
-    wanted = frozenset(terms)
-    frequency = dict.fromkeys(terms, 0)
-    for hit in hits.values():
-        tokens = frozenset(_TOKEN.findall(str(hit.text).lower()))
-        for term in tokens & wanted:
-            frequency[term] += 1
-    total = len(hits)
-    return {term: math.log((total + 1) / (frequency[term] + 1)) + 1.0 for term in terms}
-
-
-def _focused_query(terms: tuple[str, ...], weights: dict[str, float]) -> str:
-    """Return the rarest question terms, which identify the evidence pages."""
-
-    if not terms:
-        return ""
-    ordered = sorted(terms, key=lambda term: (-weights.get(term, 1.0), -len(term), term))
-    return " ".join(ordered[:_FOCUSED_TERM_LIMIT])
-
-
-def _rank_pages(hits: dict[str, object], weights: dict[str, float]) -> list[object]:
-    """Rank pages by distinct rare-term coverage, then by term density."""
-
-    if not hits:
-        return []
-    scored: list[tuple[float, int, int, object]] = []
-    for order, hit in enumerate(hits.values()):
-        tokens = _TOKEN.findall(str(hit.text).lower())
+    analyzed = [(record, _TOKEN.findall(str(record.entry.text).lower())) for record in records]
+    document_frequency: dict[str, int] = dict.fromkeys(terms, 0)
+    for _record, tokens in analyzed:
+        for term in set(tokens).intersection(document_frequency):
+            document_frequency[term] += 1
+    total = len(analyzed)
+    average_length = sum(len(tokens) for _record, tokens in analyzed) / total
+    weights = {
+        term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
+        for term, frequency in document_frequency.items()
+        if frequency
+    }
+    if not weights:
+        return [record for record, _tokens in analyzed]
+    scored: list[tuple[float, str, str, object]] = []
+    for record, tokens in analyzed:
         counts: dict[str, int] = {}
         for token in tokens:
             if token in weights:
                 counts[token] = counts.get(token, 0) + 1
-        coverage = sum(weights[term] for term in counts)
-        density = sum(weights[term] * min(count, 3) / 3 for term, count in counts.items())
-        score = (coverage + 0.25 * density) / (1.0 + 0.15 * math.log1p(len(tokens) / 100.0))
-        scored.append((-score, order, hit))
-    scored.sort(key=lambda item: (item[0], item[1]))
-    return [item[2] for item in scored]
+        length = len(tokens)
+        score = 0.0
+        for term, count in counts.items():
+            saturation = count * (_BM25_K1 + 1) / (
+                count + _BM25_K1 * (1 - _BM25_B + _BM25_B * length / average_length)
+            )
+            score += weights[term] * saturation
+        scored.append((-score, str(record.entry.entry_id), str(record.entry.entry_version_id), record))
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in scored]
 
+def _question_terms(question: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(term for term in _TOKEN.findall(question.lower()) if term not in _STOPWORDS))
 
 __all__ = [
     "PDF_PAGE_SOURCE_DEFINITION",
