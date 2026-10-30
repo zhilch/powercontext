@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +107,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[ContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class ContextFragment:
+    """One literal excerpt of a Memory entry selected for the caller's query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -160,6 +172,48 @@ class PreparedContextBuilder:
 
     def empty(self) -> PreparedContext:
         return PreparedContext(status="empty", content=None, content_bytes=0)
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        query_tokens = frozenset(_TOKEN.findall(request.query.lower()))
+        ranked: list[tuple[int, int, "_SelectionCandidate"]] = []
+        order = 0
+        for candidates in memory_candidates:
+            seen: set[tuple[str, str]] = set()
+            for hit in candidates.hits:
+                key = (hit.entry_id, hit.entry_version_id)
+                if key in seen or not hit.text.strip():
+                    continue
+                seen.add(key)
+                for start, end in _segment_spans(hit.text):
+                    text = hit.text[start:end]
+                    score = len(query_tokens & frozenset(_TOKEN.findall(text.lower())))
+                    if score:
+                        ranked.append((-score, order, _SelectionCandidate(candidates, hit, start, end, text)))
+                    order += 1
+        ranked.sort(key=lambda item: (item[0], item[1]))
+
+        selected: list[_SelectionCandidate] = []
+        for _, _, candidate in ranked:
+            trial = [*selected, candidate]
+            if len(_render_selection([_selection_item(item) for item in trial]).encode("utf-8")) <= request.max_bytes:
+                selected.append(candidate)
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        items = [_selection_item(item) for item in selected]
+        fragments = tuple(item.fragment() for item in selected)
+        content = _render_selection(items)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=fragments,
+        )
 
     def build(
         self,
@@ -228,6 +282,12 @@ class PreparedContextBuilder:
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
 
+        if request.evidence_selection:
+            return self._build_evidence_selection(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
         if len(topic_memory_hits) > self.topic_memory_candidate_limit:
@@ -728,3 +788,81 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_TOKEN = re.compile(r"[a-z]+|\d+")
+
+
+@dataclass(frozen=True)
+class _SelectionCandidate:
+    """One scored excerpt of a Memory entry."""
+
+    candidates: PreparedMemoryCandidates
+    hit: MemoryHit
+    start: int
+    end: int
+    text: str
+
+    def fragment(self) -> ContextFragment:
+        scoped = ArtifactAddress(scope_id=self.candidates.scope_id, artifact=self.hit.memory_ref)
+        return ContextFragment(
+            address=MemoryEntryAddress(
+                memory=scoped,
+                entry_id=self.hit.entry_id,
+                entry_version_id=self.hit.entry_version_id,
+            ),
+            start=self.start,
+            end=self.end,
+            text=self.text,
+        )
+
+
+def _selection_item(candidate: _SelectionCandidate) -> dict[str, object]:
+    return {
+        "citation": {
+            "scope_id": candidate.candidates.scope_id,
+            "memory_ref": candidate.hit.memory_ref.model_dump(mode="json"),
+            "entry_id": candidate.hit.entry_id,
+            "entry_version_id": candidate.hit.entry_version_id,
+        },
+        "content": candidate.text,
+        "start": candidate.start,
+        "end": candidate.end,
+    }
+
+
+def _render_selection(items: Sequence[dict[str, object]]) -> str:
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _segment_spans(text: str) -> list[tuple[int, int]]:
+    """Split text into trimmed sentence spans while preserving exact offsets."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        character = text[index]
+        if character in ".!?\n":
+            end = index if character == "\n" else index + 1
+            _append_span(text, spans, start, end)
+            cursor = index + 1
+            while cursor < length and text[cursor].isspace():
+                cursor += 1
+            start = cursor
+            index = cursor
+        else:
+            index += 1
+    _append_span(text, spans, start, length)
+    return spans
+
+
+def _append_span(text: str, spans: list[tuple[int, int]], start: int, end: int) -> None:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if end > start:
+        spans.append((start, end))
