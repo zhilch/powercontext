@@ -186,6 +186,26 @@ class NoMemoryIndex:
         return projections
 
 
+class HybridMemoryIndex(Protocol):
+    """An index that can return both channel rankings from one native statement.
+
+    ``search_hybrid`` must apply the same per-channel filters, ordering, and
+    candidate limit as the separate ``search`` calls it replaces, and it must
+    reject an unusable projection instead of silently returning one channel.
+    """
+
+    capabilities: MemoryCapabilities
+    tables: tuple[Table, ...]
+
+    async def search_hybrid(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels: ...
+
+
 class CompositeMemoryIndex:
     """Combine independent search indexes without leaking them into repositories."""
 
@@ -247,6 +267,15 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid":
+            # A backend that can express both candidate channels natively must
+            # not pay for two round trips; otherwise compose per-channel results.
+            hybrid = next(
+                (index for index in self.indexes if getattr(index, "search_hybrid", None) is not None),
+                None,
+            )
+            if hybrid is not None:
+                return await hybrid.search_hybrid(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:

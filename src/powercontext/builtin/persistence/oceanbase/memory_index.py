@@ -97,6 +97,49 @@ WHERE m.scope_id = :scope_id
 ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
 LIMIT :candidate_limit
 """
+# One statement returns both ranked candidate channels. Each UNION branch keeps
+# the exact projection, filters, ordering and per-channel candidate limit of the
+# standalone queries, so the fused ranking is the one the two-query path fed.
+_OCEANBASE_HYBRID_SEARCH_SQL = """
+(SELECT
+    'fts' AS channel,
+    h.memory_artifact_id AS memory_artifact_id,
+    h.head_revision AS head_revision,
+    h.entry_id AS entry_id,
+    h.entry_version_id AS entry_version_id,
+    v.text AS text,
+    MATCH (h.searchable_text) AGAINST (:query) AS score,
+    NULL AS distance
+FROM pc_memory_entry_heads AS h
+JOIN pc_memory_entry_versions AS v
+  ON v.scope_id = h.scope_id
+ AND v.memory_artifact_id = h.memory_artifact_id
+ AND v.entry_version_id = h.entry_version_id
+WHERE h.scope_id = :scope_id
+  AND h.memory_artifact_id IN :memory_artifact_ids
+  AND MATCH (h.searchable_text) AGAINST (:query){fts_tags}
+ORDER BY score DESC, h.memory_artifact_id, h.entry_id, h.entry_version_id
+LIMIT :candidate_limit)
+UNION ALL
+(SELECT
+    'vector' AS channel,
+    m.memory_artifact_id AS memory_artifact_id,
+    m.head_revision AS head_revision,
+    m.entry_id AS entry_id,
+    m.entry_version_id AS entry_version_id,
+    v.text AS text,
+    NULL AS score,
+    l2_distance(m.embedding, :query_vector) AS distance
+FROM pc_memory_vector_entries AS m
+JOIN pc_memory_entry_versions AS v
+  ON v.scope_id = m.scope_id
+ AND v.memory_artifact_id = m.memory_artifact_id
+ AND v.entry_version_id = m.entry_version_id
+WHERE m.scope_id = :scope_id
+  AND m.memory_artifact_id IN :memory_artifact_ids{vector_tags}
+ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
+LIMIT :candidate_limit)
+"""
 
 
 class OceanBaseMemoryFTSIndex:
@@ -285,6 +328,23 @@ class OceanBaseMemoryVectorIndex:
             bindparam("tag_hashes", expanding=True),
             bindparam("query_vector", type_=VECTOR(profile.dimension)),
         )
+        self._hybrid_sql = text(
+            _OCEANBASE_HYBRID_SEARCH_SQL.format(fts_tags="", vector_tags="")
+        ).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("query_vector", type_=VECTOR(profile.dimension)),
+        )
+        self._tagged_hybrid_sql = text(
+            _OCEANBASE_HYBRID_SEARCH_SQL.format(
+                fts_tags=memory_tag_sql("h"),
+                vector_tags=memory_tag_sql("m"),
+            )
+        ).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("tag_keys", expanding=True),
+            bindparam("tag_hashes", expanding=True),
+            bindparam("query_vector", type_=VECTOR(profile.dimension)),
+        )
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
         if connection.dialect.name != "mysql":
@@ -393,6 +453,64 @@ class OceanBaseMemoryVectorIndex:
             )
         ).mappings()
         return MemorySearchChannels(vector=memory_channel_hits(rows, request.memories))
+
+    async def search_hybrid(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels:
+        """Return both candidate channels from exactly one native statement.
+
+        The vector projection carries the head revision it was written at, so a
+        revised entry keeps its older projection row; both branches therefore
+        filter on Scope and Memory identity only and the caller's validated head
+        remains the reference authority.
+        """
+
+        if request.mode != "hybrid":
+            return MemorySearchChannels()
+        if request.embedding_profile != self.profile or request.query_vector is None:
+            raise CapabilityNotSupportedError("embedding-profile")
+        if not await self.vector_complete(connection, scope_id, request.memories, self.profile):
+            raise CapabilityNotSupportedError("vector")
+        rows = (
+            await connection.execute(
+                self._hybrid_sql if request.tag_filter is None else self._tagged_hybrid_sql,
+                {
+                    "scope_id": scope_id,
+                    "query": request.analyzed_query,
+                    "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+                    "query_vector": validate_embedding(
+                        request.query_vector,
+                        dimension=self.profile.dimension,
+                    ),
+                    "candidate_limit": request.candidate_limit,
+                    **memory_tag_parameters(request.tag_filter),
+                },
+            )
+        ).mappings().all()
+        # UNION ALL preserves each branch's TOP-N, but channel order must not
+        # depend on that: rank each channel again by the value the branch ordered
+        # on, keeping the backend order as the tie-breaker.
+        fts_rows = sorted(
+            (row for row in rows if row["channel"] == "fts"),
+            key=lambda row: (
+                -float(row["score"]),
+                str(row["memory_artifact_id"]),
+                str(row["entry_id"]),
+                str(row["entry_version_id"]),
+            ),
+        )
+        vector_rows = sorted(
+            (row for row in rows if row["channel"] == "vector"),
+            key=lambda row: float(row["distance"]),
+        )
+        return MemorySearchChannels(
+            fts=memory_channel_hits(fts_rows, request.memories),
+            vector=memory_channel_hits(vector_rows, request.memories),
+        )
 
     async def vector_complete(
         self,
