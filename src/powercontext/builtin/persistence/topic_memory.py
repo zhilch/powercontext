@@ -40,6 +40,7 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemoryDraft,
     TopicMemoryProjection,
     TopicMemoryProjectionError,
+    TopicMemorySearchChannels,
     TopicMemorySearchMode,
     TopicMemorySearchRequest,
     TopicMemorySearchResult,
@@ -488,6 +489,7 @@ class TopicMemoryRepository:
         )
         channels = await self.index.search(connection, scope_id, request)
         await self._check_retrieval_shape(connection)
+        channels = await self._only_current(connection, scope_id, channels)
         outcome = _fuse_topic_memory_rankings(query, channels, limit, mode=used_mode, admission=admission)
         return TopicMemorySearchResult(
             mode=used_mode,
@@ -499,6 +501,41 @@ class TopicMemoryRepository:
                 admitted=outcome.admitted,
                 rejected=outcome.rejected,
             ),
+        )
+
+    async def _only_current(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        channels: TopicMemorySearchChannels,
+    ) -> TopicMemorySearchChannels:
+        """Drop candidates whose Topic head left the current working set.
+
+        A Topic that lost its evidence support is deprecated, not deleted: its
+        exact Revisions stay readable through the records path, but it must not
+        surface in native Topic search or in a Context built from those hits.
+        """
+
+        suppressed = set(
+            (
+                await connection.execute(
+                    select(ARTIFACT_HEADS_TABLE.c.artifact_id).where(
+                        ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                        ARTIFACT_HEADS_TABLE.c.family == TopicMemory.family,
+                        ARTIFACT_HEADS_TABLE.c.lifecycle_state != "active",
+                    )
+                )
+            ).scalars()
+        )
+        if not suppressed:
+            return channels
+        return channels.model_copy(
+            update={
+                field: tuple(
+                    hit for hit in getattr(channels, field) if hit.artifact_ref.artifact_id not in suppressed
+                )
+                for field in ("topic_fts", "topic_vector", "detail_fts", "detail_vector")
+            }
         )
 
     async def _activate(

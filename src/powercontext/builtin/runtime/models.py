@@ -311,6 +311,13 @@ class RetireMemoryEntryRequest(BaseModel):
     reason: str | None = None
 
 
+class ReactivateMemoryEntryRequest(BaseModel):
+    """Restore one inactive entry version without changing its body."""
+
+    citation: MemoryCitation
+    reason: str | None = None
+
+
 class MemoryMutationResult(BaseModel):
     previous_revision: int | None
     memory_ref: ArtifactRef

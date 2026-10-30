@@ -152,6 +152,7 @@ from powercontext.builtin.persistence.recurrence import RecurrenceRepository
 from powercontext.builtin.persistence.skill_packages import SkillPackageRepository
 from powercontext.builtin.persistence.skill_publications import SkillPublicationRepository
 from powercontext.builtin.persistence.source_definitions import SourceDefinitionManifestRepository
+from powercontext.builtin.persistence.source_lifecycle import SourceLifecycleStore
 from powercontext.builtin.persistence.sources import SourceRepository, StoredSource
 from powercontext.builtin.persistence.statistics import StatisticsRepository
 from powercontext.builtin.persistence.supervision import (
@@ -770,6 +771,15 @@ class RelationalContexts:
         """Return product statistics bound to one scope."""
 
         return self._services_for(scope_id).statistics()
+
+    def source_lifecycle(self, scope_id: str, /) -> SourceLifecycleStore:
+        """Return the durable evidence graph of one Scope."""
+
+        return SourceLifecycleStore(
+            database=self.database,
+            scope_id=validate_scope_id(scope_id),
+            governance=self.repositories.governance,
+        )
 
     def model_usage_reporter(
         self, scope_id: str, /
