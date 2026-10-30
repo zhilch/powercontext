@@ -20,6 +20,7 @@ import hashlib
 import io
 import math
 import re
+from collections import Counter
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field
@@ -176,9 +177,10 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
     """Return up to the requested number of distinct page citations for one question.
 
     A natural-language question mixes the evidence request with instructions and
-    filler. Scoring every page against the whole corpus with BM25 keeps the
-    distinctive terms in charge and lets a definition sentence contribute its
-    vocabulary without letting one rare filler word decide the ranking. Only the
+    filler, and filings phrase the same fact with different words than the caller
+    does. Each stored page is therefore scored under several query readings —
+    literal, domain-vocabulary expanded, and instruction-stripped with repeated
+    terms counted — and the readings are fused by reciprocal rank. Only the
     public Memory read path is used, and every citation is the exact entry
     version the ranking read.
     """
@@ -189,20 +191,26 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
         raise ValueError("question must be a non-empty string")
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
-    terms = _question_terms(question)
-    if not terms:
+    readings = _query_readings(question)
+    if not readings:
         return ()
     records = await _stored_pages(memory)
     if not records:
         return ()
-    ranked = _rank_pages(records, terms)
+    fused: dict[int, float] = {}
+    for terms, repetitions in readings:
+        for rank, index in enumerate(_rank_pages(records, terms, repetitions), start=1):
+            if rank > _FUSION_DEPTH:
+                break
+            fused[index] = fused.get(index, 0.0) + 1.0 / (_FUSION_RRF_CONSTANT + rank)
+    ordered = sorted(fused, key=lambda index: (-fused[index], index))
     return tuple(
         MemoryCitation(
-            memory_ref=record.memory_ref,
-            entry_id=record.entry.entry_id,
-            entry_version_id=record.entry.entry_version_id,
+            memory_ref=records[index].memory_ref,
+            entry_id=records[index].entry.entry_id,
+            entry_version_id=records[index].entry.entry_version_id,
         )
-        for record in ranked[:limit]
+        for index in ordered[:limit]
     )
 
 
@@ -217,50 +225,114 @@ _STOPWORDS = frozenset(
     which while who whom why will with would you your yours yourself yourselves
     """.split()
 )
+# Generic filing vocabulary: questions speak analyst language, filings name line
+# items. Expansions are added to one reading only, at a lower weight.
+_EXPANSIONS = {
+    "battles": ("litigation", "proceedings"),
+    "battle": ("litigation", "proceedings"),
+    "legal": ("litigation", "proceedings"),
+    "geographies": ("geographic", "regions", "countries"),
+    "geography": ("geographic", "regions"),
+    "capex": ("expenditures", "property"),
+    "employees": ("headcount", "workforce"),
+    "revenue": ("sales",),
+    "restructuring": ("severance", "charges"),
+    "margin": ("income",),
+}
+_INSTRUCTION = re.compile(
+    r"^\s*(?:respond|answer|give|assume|provide|please|use |using |rely|relying|calculate|compute|"
+    r"state |if |round|show your|your answer|write )",
+    re.IGNORECASE,
+)
 _BM25_K1 = 1.2
 _BM25_B = 0.75
+_EXPANSION_WEIGHT = 0.5
+_REPETITION_WEIGHT = 0.5
+_FUSION_DEPTH = 100
+_FUSION_RRF_CONSTANT = 60
+
+
+def _query_readings(question: str) -> tuple[tuple[tuple[str, ...], dict[str, float]], ...]:
+    """Return the query readings whose rankings are fused for one question."""
+
+    literal = _question_terms(question)
+    if not literal:
+        return ()
+    return (
+        (literal, {term: 1.0 for term in dict.fromkeys(literal)}),
+        (_expanded_terms(question), _repetition_weights(question)),
+        (_expanded_terms(question, strip_instructions=True), _repetition_weights(question, strip=True)),
+    )
+
+
+def _question_terms(question: str, *, strip_instructions: bool = False) -> tuple[str, ...]:
+    text = question
+    if strip_instructions:
+        sentences = re.split(r"(?<=[.!?])\s+", question)
+        kept = [sentence for sentence in sentences if not _INSTRUCTION.match(sentence)]
+        if kept:
+            text = " ".join(kept)
+    return tuple(dict.fromkeys(term for term in _TOKEN.findall(text.lower()) if term not in _STOPWORDS))
+
+
+def _expanded_terms(question: str, *, strip_instructions: bool = False) -> tuple[str, ...]:
+    terms = _question_terms(question, strip_instructions=strip_instructions)
+    extra: list[str] = []
+    for term in terms:
+        extra.extend(_EXPANSIONS.get(term, ()))
+    return tuple(dict.fromkeys((*terms, *extra)))
+
+
+def _repetition_weights(question: str, *, strip: bool = False) -> dict[str, float]:
+    counts = Counter(_question_terms(question, strip_instructions=strip))
+    return {term: 1.0 + _REPETITION_WEIGHT * count for term, count in counts.items()}
+
+
 async def _stored_pages(memory: object) -> tuple[object, ...]:
     """Read the current stored page entries through the public Memory read path."""
 
     page = await memory.list()
     return tuple(record for record in page.entries if record.entry.text.strip())
 
-def _rank_pages(records: tuple[object, ...], terms: tuple[str, ...]) -> list[object]:
-    """Rank page entries by BM25 over the whole stored corpus."""
 
-    analyzed = [(record, _TOKEN.findall(str(record.entry.text).lower())) for record in records]
+def _rank_pages(
+    records: tuple[object, ...],
+    terms: tuple[str, ...],
+    repetitions: dict[str, float],
+) -> list[int]:
+    """Rank page indexes by BM25 over the whole stored corpus."""
+
+    analyzed = [_TOKEN.findall(str(record.entry.text).lower()) for record in records]
     document_frequency: dict[str, int] = dict.fromkeys(terms, 0)
-    for _record, tokens in analyzed:
+    for tokens in analyzed:
         for term in set(tokens).intersection(document_frequency):
             document_frequency[term] += 1
     total = len(analyzed)
-    average_length = sum(len(tokens) for _record, tokens in analyzed) / total
     weights = {
-        term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
+        term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5)) * repetitions.get(term, 1.0)
         for term, frequency in document_frequency.items()
         if frequency
     }
     if not weights:
-        return [record for record, _tokens in analyzed]
-    scored: list[tuple[float, str, str, object]] = []
-    for record, tokens in analyzed:
+        return list(range(len(analyzed)))
+    average_length = sum(len(tokens) for tokens in analyzed) / total
+    scored: list[tuple[float, int]] = []
+    for index, tokens in enumerate(analyzed):
         counts: dict[str, int] = {}
         for token in tokens:
             if token in weights:
                 counts[token] = counts.get(token, 0) + 1
-        length = len(tokens)
         score = 0.0
-        for term, count in counts.items():
-            saturation = count * (_BM25_K1 + 1) / (
-                count + _BM25_K1 * (1 - _BM25_B + _BM25_B * length / average_length)
+        if counts:
+            length = len(tokens)
+            normalization = _BM25_K1 * (1 - _BM25_B + _BM25_B * length / average_length)
+            score = sum(
+                weights[term] * count * (_BM25_K1 + 1) / (count + normalization)
+                for term, count in counts.items()
             )
-            score += weights[term] * saturation
-        scored.append((-score, str(record.entry.entry_id), str(record.entry.entry_version_id), record))
-    scored.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [item[3] for item in scored]
-
-def _question_terms(question: str) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(term for term in _TOKEN.findall(question.lower()) if term not in _STOPWORDS))
+        scored.append((-score, index))
+    scored.sort()
+    return [index for _score, index in scored]
 
 __all__ = [
     "PDF_PAGE_SOURCE_DEFINITION",
