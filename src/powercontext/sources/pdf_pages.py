@@ -200,6 +200,7 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
     if not records:
         return ()
     analyzed = [_analyze(str(record.entry.text)) for record in records]
+    titles = [_heading_text(_page_body(str(record.entry.text))) for record in records]
     fused: dict[int, float] = {}
     for terms, repetitions in readings:
         for rank, index in enumerate(_rank_pages(analyzed, terms, repetitions), start=1):
@@ -207,6 +208,7 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
                 break
             fused[index] = fused.get(index, 0.0) + 1.0 / (_FUSION_RRF_CONSTANT + rank)
     ordered = sorted(fused, key=lambda index: (-fused[index], index))
+    ordered = _with_statement_pages(question, titles, ordered, limit)
     return tuple(
         MemoryCitation(
             memory_ref=records[index].memory_ref,
@@ -258,6 +260,51 @@ _HEADING_LINES = 3
 _FUSION_DEPTH = 100
 _FUSION_RRF_CONSTANT = 60
 _MAX_IDENTITY_LINE = 128
+# A metric question is answered on a primary statement; the page itself rarely
+# repeats the metric's name, so those pages are reserved inside the ranking.
+_METRIC_WORDS = frozenset(
+    """
+    capital cost costs earnings ebitda equity expense expenses gross income liability liabilities liquidity margin
+    margins net profit quick ratio ratios rate rates revenue revenues sales tax taxes working
+    """.split()
+)
+# A primary statement owns its own page title; segment tables only embed the
+# words "income statement data" in a caption, so the title must open with it.
+_STATEMENT_TITLE = re.compile(
+    r"^(?:condensed\s+)?(?:consolidated\s+)?(?:statements?\b|balance\s+sheets?\b)",
+    re.IGNORECASE,
+)
+_STATEMENT_RESERVE = 5
+
+
+def _statement_indexes(titles: Sequence[str], limit: int) -> list[int]:
+    """Return the first page of each primary financial statement."""
+
+    found: list[int] = []
+    for index, title in enumerate(titles):
+        if any(_STATEMENT_TITLE.match(line.strip()) for line in title.splitlines() if line.strip()):
+            found.append(index)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _with_statement_pages(
+    question: str,
+    titles: Sequence[str],
+    ordered: Sequence[int],
+    limit: int,
+) -> list[int]:
+    """Reserve result slots for the primary statements a metric question needs."""
+
+    if not (_METRIC_WORDS & set(_TOKEN.findall(question.lower()))):
+        return list(ordered)
+    reserved = _statement_indexes(titles, _STATEMENT_RESERVE)
+    if not reserved:
+        return list(ordered)
+    head = [index for index in ordered if index not in reserved][: max(limit - len(reserved), 0)]
+    merged = head + [index for index in reserved if index not in head]
+    return merged + [index for index in ordered if index not in merged]
 
 
 def _analyze(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
