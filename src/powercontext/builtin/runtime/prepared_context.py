@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -180,8 +181,7 @@ class PreparedContextBuilder:
         current_scope_id: str | None,
         memory_candidates: Sequence[PreparedMemoryCandidates],
     ) -> PreparedContextBuild:
-        query_tokens = frozenset(_TOKEN.findall(request.query.lower()))
-        ranked: list[tuple[int, int, "_SelectionCandidate"]] = []
+        segments: list[_SelectionCandidate] = []
         order = 0
         for candidates in memory_candidates:
             seen: set[tuple[str, str]] = set()
@@ -192,17 +192,12 @@ class PreparedContextBuilder:
                 seen.add(key)
                 for start, end in _segment_spans(hit.text):
                     text = hit.text[start:end]
-                    score = len(query_tokens & frozenset(_TOKEN.findall(text.lower())))
-                    if score:
-                        ranked.append((-score, order, _SelectionCandidate(candidates, hit, start, end, text)))
-                    order += 1
-        ranked.sort(key=lambda item: (item[0], item[1]))
-
-        selected: list[_SelectionCandidate] = []
-        for _, _, candidate in ranked:
-            trial = [*selected, candidate]
-            if len(_render_selection([_selection_item(item) for item in trial]).encode("utf-8")) <= request.max_bytes:
-                selected.append(candidate)
+                    tokens = frozenset(_TOKEN.findall(text.lower()))
+                    if tokens:
+                        segments.append(_SelectionCandidate(candidates, hit, start, end, text, tokens, order))
+                        order += 1
+        weights = _query_weights(segments, request.query)
+        selected = _select_segments(segments, weights, request.max_bytes) if weights else []
         if not selected:
             return PreparedContextBuild(context=self.empty(), origins=())
 
@@ -791,6 +786,19 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
 
 
 _TOKEN = re.compile(r"[a-z]+|\d+")
+_STOPWORDS = frozenset(
+    """
+    a about above after again against all also am an and any are as at be because been before being below between
+    both but by can could did do does doing down during each few for from further had has have having he her here
+    hers herself him himself his how i if in into is it its itself just me more most my myself no nor not now of
+    off on once only or other our ours ourselves out over own same she should so some such than that the their
+    theirs them themselves then there these they this those through to too under until up very was we were what
+    when where which while who whom why will with would you your yours yourself yourselves
+    """.split()
+)
+_MIN_SELECTION_CHARS = 80
+_REPEAT_TERM_WEIGHT = 0.2
+_SAME_ENTRY_BOOST = 1.3
 
 
 @dataclass(frozen=True)
@@ -802,6 +810,8 @@ class _SelectionCandidate:
     start: int
     end: int
     text: str
+    tokens: frozenset[str]
+    order: int
 
     def fragment(self) -> ContextFragment:
         scoped = ArtifactAddress(scope_id=self.candidates.scope_id, artifact=self.hit.memory_ref)
@@ -815,6 +825,110 @@ class _SelectionCandidate:
             end=self.end,
             text=self.text,
         )
+
+    def truncated(self, length: int) -> _SelectionCandidate:
+        """Return a shorter prefix of this excerpt that keeps exact offsets."""
+
+        prefix = self.text[:length].rstrip()
+        return replace(self, end=self.start + len(prefix), text=prefix)
+
+
+def _query_weights(segments: Sequence[_SelectionCandidate], query: str) -> dict[str, float]:
+    """Weight query terms by how rare they are across the candidate excerpts.
+
+    A term shared by every excerpt cannot discriminate between them, so it
+    carries little weight; a term unique to one excerpt is what identifies the
+    evidence the caller asked for.
+    """
+
+    terms = tuple(dict.fromkeys(term for term in _TOKEN.findall(query.lower()) if term not in _STOPWORDS))
+    if not terms or not segments:
+        return {}
+    wanted = frozenset(terms)
+    frequency: dict[str, int] = dict.fromkeys(terms, 0)
+    for segment in segments:
+        for term in segment.tokens & wanted:
+            frequency[term] += 1
+    total = len(segments)
+    return {term: math.log((total + 1) / (frequency[term] + 1)) + 1.0 for term in terms}
+
+
+def _selection_gain(
+    segment: _SelectionCandidate,
+    weights: dict[str, float],
+    covered: frozenset[str],
+    *,
+    preferred_entry: str | None,
+) -> float:
+    fresh = sum(weight for term, weight in weights.items() if term in segment.tokens and term not in covered)
+    repeated = sum(weight for term, weight in weights.items() if term in segment.tokens and term in covered)
+    gain = fresh + _REPEAT_TERM_WEIGHT * repeated
+    if preferred_entry is not None and segment.hit.entry_id == preferred_entry:
+        # Evidence for one claim usually sits in a single passage; keep reading
+        # the passage that already scored best before jumping to another one.
+        gain *= _SAME_ENTRY_BOOST
+    return gain
+
+
+def _fits(selected: Sequence[_SelectionCandidate], max_bytes: int) -> bool:
+    rendered = _render_selection([_selection_item(item) for item in selected])
+    return len(rendered.encode("utf-8")) <= max_bytes
+
+
+def _select_segments(
+    segments: Sequence[_SelectionCandidate],
+    weights: dict[str, float],
+    max_bytes: int,
+) -> list[_SelectionCandidate]:
+    """Pick the excerpts that cover the most query weight within the byte budget."""
+
+    remaining = list(segments)
+    selected: list[_SelectionCandidate] = []
+    covered: frozenset[str] = frozenset()
+    preferred_entry: str | None = None
+    while remaining:
+        best: _SelectionCandidate | None = None
+        best_gain = 0.0
+        for segment in remaining:
+            gain = _selection_gain(segment, weights, covered, preferred_entry=preferred_entry)
+            if gain > best_gain:
+                best, best_gain = segment, gain
+        if best is None:
+            break
+        remaining.remove(best)
+        if _fits((*selected, best), max_bytes):
+            selected.append(best)
+        else:
+            shortened = _shorten_to_fit(best, selected, max_bytes)
+            if shortened is None:
+                continue
+            selected.append(shortened)
+        covered = covered | (selected[-1].tokens & weights.keys())
+        if preferred_entry is None:
+            preferred_entry = selected[-1].hit.entry_id
+    return selected
+
+
+def _shorten_to_fit(
+    segment: _SelectionCandidate,
+    selected: Sequence[_SelectionCandidate],
+    max_bytes: int,
+) -> _SelectionCandidate | None:
+    """Truncate an excerpt to the remaining budget at a character boundary."""
+
+    low, high = 1, len(segment.text)
+    fitting: _SelectionCandidate | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        trial = segment.truncated(middle)
+        if trial.text and _fits((*selected, trial), max_bytes):
+            fitting = trial
+            low = middle + 1
+        else:
+            high = middle - 1
+    if fitting is None or len(fitting.text) < _MIN_SELECTION_CHARS:
+        return None
+    return fitting
 
 
 def _selection_item(candidate: _SelectionCandidate) -> dict[str, object]:
