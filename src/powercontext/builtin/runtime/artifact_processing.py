@@ -79,6 +79,7 @@ _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
+_COUNT_POLL_SECONDS = 0.2
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -100,6 +101,20 @@ class ArtifactProcessingPendingProvider(Protocol):
         ...
 
 
+class ArtifactProcessingCountAdmission(Protocol):
+    """Accept processing for Scopes that reached their pending-count threshold."""
+
+    async def request_pending(
+        self,
+        connection: AsyncConnection,
+        after_scope_id: str | None,
+        limit: int,
+        /,
+    ) -> CountAdmissionPage:
+        """Accept the bounded next page and return its keyset position."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactProcessingBinding:
     """Startup registration of one Family and its independently budgeted Worker."""
@@ -114,6 +129,10 @@ class ArtifactProcessingBinding:
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
+    # Optional count admission: accept a Scope's processing once it has enough
+    # unprocessed journal identities, independently of any time condition.
+    count_threshold: int | None = None
+    count_admission: ArtifactProcessingCountAdmission | None = None
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
@@ -138,6 +157,13 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        if self.count_threshold is not None:
+            if type(self.count_threshold) is not int or self.count_threshold < 1:
+                raise ValueError("count_threshold must be a positive integer")  # noqa: TRY003
+            if self.count_admission is None:
+                raise ValueError("count_threshold requires a count admission provider")  # noqa: TRY003
+        elif self.count_admission is not None:
+            raise ValueError("count admission requires a count_threshold")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -397,6 +423,7 @@ class _FamilyState:
     scan_in_progress: bool = False
     reconcile_after: str | None = None
     reconcile_complete: bool = False
+    count_after: str | None = None
     notification_at_start: int = 0
     discovery_pending: bool = True
     next_schedule_at: float | None = None
@@ -648,6 +675,7 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
+        await self._request_count_admission(state)
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
@@ -656,6 +684,24 @@ class ArtifactProcessingSupervisor:
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+
+    async def _request_count_admission(self, state: _FamilyState) -> None:
+        """Accept Scopes that reached their pending-count threshold.
+
+        The page is keyset bounded so a deployment with many Scopes pays at most
+        one page per cycle, and it wraps around to re-check from the start.
+        """
+
+        admission = state.binding.count_admission
+        if admission is None:
+            return
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            page = await admission.request_pending(connection, state.count_after, _DISCOVERY_PAGE_SIZE)
+        state.count_after = page.next_after_scope_id
+        if page.accepted:
+            # Newly accepted requests join the requested channel in this cycle.
+            state.discovery_pending = True
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -1059,6 +1105,7 @@ class ArtifactProcessingSupervisor:
             state.retries.clear()
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
+            state.count_after = None
             state.discovery_pending = True
 
     async def _reap_unconfirmed_exits(self) -> None:
@@ -1095,6 +1142,10 @@ class ArtifactProcessingSupervisor:
                 deadlines.append(state.next_schedule_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
+            if state.binding.count_admission is not None:
+                # A pending-count condition has no notification source, so the
+                # Supervisor samples it on a bounded interval while a Worker is free.
+                deadlines.append(now + _COUNT_POLL_SECONDS)
         return None if not deadlines else max(0.001, min(deadlines) - now)
 
     def _log_failure(

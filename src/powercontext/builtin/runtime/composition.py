@@ -21,6 +21,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from dataclasses import replace
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -140,7 +141,11 @@ from powercontext.builtin.runtime.decision_model import (
 from powercontext.builtin.runtime.family_processing import FAMILY_BINDINGS, FamilyWorkerSpec, run_family_worker
 from powercontext.builtin.runtime.memory_write_gate import build_memory_write_gate
 from powercontext.builtin.runtime.models import MemorySearchMode, RuntimeCapabilities
-from powercontext.builtin.runtime.processing_discovery import SourceProcessingPendingProvider, enabled_profile_scopes
+from powercontext.builtin.runtime.processing_discovery import (
+    SourceCountAdmission,
+    SourceProcessingPendingProvider,
+    enabled_profile_scopes,
+)
 from powercontext.builtin.runtime.processing_registry import (
     canonical_processing_manifest,
     dream_operations,
@@ -791,7 +796,27 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
             )
         )
     _validate_processing_registrations(configured)
-    return tuple(configured)
+    return tuple(_with_count_admission(config, binding) for binding in configured)
+
+
+def _with_count_admission(
+    config: BuiltinConfig,
+    binding: ArtifactProcessingBinding,
+) -> ArtifactProcessingBinding:
+    """Attach the optional per-Family pending-count threshold to one registration."""
+
+    thresholds = {
+        "memory": config.runtime.memory_source_count_threshold,
+        "topic-memory": config.runtime.topic_memory_source_count_threshold,
+    }
+    threshold = thresholds.get(binding.artifact_family)
+    if threshold is None or binding.count_admission is not None:
+        return binding
+    return replace(
+        binding,
+        count_threshold=threshold,
+        count_admission=SourceCountAdmission(binding.binding_name, threshold),
+    )
 
 
 def _validate_processing_registrations(configured: Sequence[ArtifactProcessingBinding]) -> None:

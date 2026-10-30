@@ -781,6 +781,27 @@ class RelationalContexts:
             governance=self.repositories.governance,
         )
 
+    async def source_pending_count(self, scope_id: str, binding_name: str, /) -> int:
+        """Count journal identities a Family has not committed past yet.
+
+        The count is identity based: re-capturing an existing Source or
+        upgrading a receipt keeps its journal position, so neither adds work.
+        """
+
+        services = self._services_for(scope_id)
+        async with services.database.transaction() as connection:
+            head = await services.repositories.sources.journal_position(connection, services.scope_id)
+            state = await services.repositories.cursors.load(connection, services.scope_id, binding_name)
+        committed = 0 if state is None else state.cursor.sequence
+        return max(0, head - committed)
+
+    async def request_source_processing(self, scope_id: str, binding_name: str, /) -> None:
+        """Accept one invocation for a Family without running it in this process."""
+
+        services = self._services_for(scope_id)
+        async with services.database.transaction() as connection:
+            await ArtifactProcessingIntentRepository().request(connection, services.scope_id, binding_name)
+
     def model_usage_reporter(
         self, scope_id: str, /
     ) -> Callable[[ModelUsagePurpose, ModelUsageOperation, InferenceUsage], Awaitable[None]]:

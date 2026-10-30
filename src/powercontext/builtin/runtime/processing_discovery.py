@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -74,3 +76,56 @@ class SourceProcessingPendingProvider:
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None
+
+
+@dataclass(frozen=True, slots=True)
+class CountAdmissionPage:
+    """One bounded keyset page of count-triggered acceptances."""
+
+    next_after_scope_id: str | None
+    accepted: int
+
+
+class SourceCountAdmission:
+    """Accept processing once a Scope has enough unprocessed journal identities.
+
+    The check is per Scope and per Family: it compares the Family's committed
+    cursor with the Source journal high watermark. One accepted request is left
+    outstanding per Scope, so a slow Worker is never asked twice and a failed
+    attempt keeps its durable request until it succeeds.
+    """
+
+    def __init__(self, binding_name: str, threshold: int) -> None:
+        if type(threshold) is not int or threshold < 1:
+            raise ValueError("source count threshold must be a positive integer")  # noqa: TRY003
+        self._binding = binding_name
+        self._threshold = threshold
+
+    async def request_pending(
+        self,
+        connection: AsyncConnection,
+        after_scope_id: str | None,
+        limit: int,
+        /,
+    ) -> CountAdmissionPage:
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        statement = select(heads.c.scope_id, heads.c.position).order_by(heads.c.scope_id).limit(limit)
+        if after_scope_id is not None:
+            statement = statement.where(heads.c.scope_id > after_scope_id)
+        rows = (await connection.execute(statement)).all()
+        intents = ArtifactProcessingIntentRepository()
+        cursors = SourceCursorRepository()
+        accepted = 0
+        for scope, high in rows:
+            scope_id = str(scope)
+            cursor = await cursors.load(connection, scope_id, self._binding)
+            pending = int(high) - (0 if cursor is None else cursor.cursor.sequence)
+            if pending < self._threshold:
+                continue
+            intent = await intents.load(connection, scope_id, self._binding, for_update=True)
+            if intent is not None and intent.requested_generation > intent.handled_generation:
+                continue
+            await intents.request(connection, scope_id, self._binding)
+            accepted += 1
+        next_after = str(rows[-1][0]) if len(rows) == limit else None
+        return CountAdmissionPage(next_after_scope_id=next_after, accepted=accepted)
