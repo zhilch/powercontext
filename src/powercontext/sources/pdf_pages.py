@@ -253,16 +253,33 @@ _INSTRUCTION = re.compile(
 _BM25_K1 = 1.2
 _BM25_B = 0.75
 _REPETITION_WEIGHT = 0.5
-_HEADING_WEIGHT = 3.0
+_HEADING_WEIGHT = 2.0
 _HEADING_LINES = 3
 _FUSION_DEPTH = 100
 _FUSION_RRF_CONSTANT = 60
+_MAX_IDENTITY_LINE = 128
 
 
 def _analyze(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the page body tokens and its title-region tokens."""
 
-    return tuple(_TOKEN.findall(text.lower())), tuple(_TOKEN.findall(_heading_text(text).lower()))
+    body = _page_body(text)
+    return tuple(_TOKEN.findall(body.lower())), tuple(_TOKEN.findall(_heading_text(body).lower()))
+
+
+def _page_body(text: str) -> str:
+    """Drop the document identity line so it cannot match every page equally.
+
+    A page entry is stored as ``DOCUMENT_ID`` on its own line followed by the
+    page text. That identity appears on every page of the document, so leaving it
+    in the ranking text adds a term that cannot discriminate between pages while
+    diluting the weights that can.
+    """
+
+    first, separator, rest = text.partition("\n")
+    if separator and rest.strip() and len(first) <= _MAX_IDENTITY_LINE and " " not in first.strip():
+        return rest
+    return text
 
 
 def _heading_text(text: str) -> str:
