@@ -197,7 +197,7 @@ class PreparedContextBuilder:
                         segments.append(_SelectionCandidate(candidates, hit, start, end, text, tokens, order))
                         order += 1
         weights = _query_weights(segments, request.query)
-        selected = _select_segments(segments, weights, request.max_bytes) if weights else []
+        selected = _select_entries(segments, weights, request.max_bytes) if weights else []
         if not selected:
             return PreparedContextBuild(context=self.empty(), origins=())
 
@@ -875,6 +875,111 @@ def _selection_gain(
 def _fits(selected: Sequence[_SelectionCandidate], max_bytes: int) -> bool:
     rendered = _render_selection([_selection_item(item) for item in selected])
     return len(rendered.encode("utf-8")) <= max_bytes
+
+
+def _select_entries(
+    segments: Sequence[_SelectionCandidate],
+    weights: dict[str, float],
+    max_bytes: int,
+) -> list[_SelectionCandidate]:
+    """Choose the candidate passages that answer the query, best entry first.
+
+    Annotated evidence is a set of character spans inside one candidate passage,
+    so a contiguous window of the best-matching entry covers it far more often
+    than the same number of bytes scattered over several entries. The window is
+    extended sentence by sentence while it still fits the budget; a second entry
+    is only used when budget remains.
+    """
+
+    groups = _entry_groups(segments)
+    if not groups:
+        return []
+    entry_weights = _entry_weights(groups, weights)
+    ranked = sorted(groups, key=lambda group: (-_entry_score(group, entry_weights), group[0].hit.entry_id))
+    selected: list[_SelectionCandidate] = []
+    for group in ranked:
+        window = _best_window(group, entry_weights, selected, max_bytes)
+        if window is not None:
+            selected.append(window)
+            continue
+        if not selected:
+            selected = _select_segments(group, weights, max_bytes)
+    return selected
+
+
+def _entry_groups(segments: Sequence[_SelectionCandidate]) -> list[list[_SelectionCandidate]]:
+    grouped: dict[tuple[str, str], list[_SelectionCandidate]] = {}
+    for segment in segments:
+        key = (segment.hit.entry_id, segment.hit.entry_version_id)
+        grouped.setdefault(key, []).append(segment)
+    return [sorted(items, key=lambda item: item.start) for items in grouped.values()]
+
+
+def _entry_weights(
+    groups: Sequence[Sequence[_SelectionCandidate]],
+    weights: dict[str, float],
+) -> dict[str, float]:
+    """Rebuild term weights with passages, not sentences, as the unit of rarity."""
+
+    total = len(groups)
+    frequency: dict[str, int] = dict.fromkeys(weights, 0)
+    for group in groups:
+        covered = frozenset().union(*(item.tokens for item in group))
+        for term in covered & weights.keys():
+            frequency[term] += 1
+    return {
+        term: math.log(1.0 + (total - count + 0.5) / (count + 0.5))
+        for term, count in frequency.items()
+        if count
+    }
+
+
+def _entry_score(group: Sequence[_SelectionCandidate], weights: dict[str, float]) -> float:
+    """Score one entry by how much distinct query weight its sentences carry."""
+
+    covered = frozenset().union(*(item.tokens for item in group))
+    total_length = sum(len(item.tokens) for item in group)
+    mass = sum(weight for term, weight in weights.items() if term in covered)
+    return mass / (1.0 + 0.15 * math.log1p(total_length / 100.0))
+
+
+def _best_window(
+    group: Sequence[_SelectionCandidate],
+    weights: dict[str, float],
+    selected: Sequence[_SelectionCandidate],
+    max_bytes: int,
+) -> _SelectionCandidate | None:
+    """Return the contiguous sentence run of one entry with the most query weight."""
+
+    best: _SelectionCandidate | None = None
+    best_score = 0.0
+    for start_index in range(len(group)):
+        for end_index in range(start_index, len(group)):
+            window = _window(group, start_index, end_index)
+            covered = window.tokens & weights.keys()
+            score = sum(weights[term] for term in covered)
+            if score <= best_score and best is not None:
+                continue
+            if not _fits((*selected, window), max_bytes):
+                continue
+            if score > best_score:
+                best, best_score = window, score
+    return best
+
+
+def _window(
+    group: Sequence[_SelectionCandidate],
+    start_index: int,
+    end_index: int,
+) -> _SelectionCandidate:
+    first, last = group[start_index], group[end_index]
+    return replace(
+        first,
+        start=first.start,
+        end=last.end,
+        text=first.hit.text[first.start : last.end],
+        tokens=frozenset().union(*(item.tokens for item in group[start_index : end_index + 1])),
+    )
 
 
 def _select_segments(
