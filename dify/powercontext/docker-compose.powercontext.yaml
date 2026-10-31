@@ -1,0 +1,31 @@
+# PowerContext 记忆服务（与 Dify 同网络）
+#
+# 用法（在 dify/powercontext 目录）：
+#   docker compose -f docker-compose.powercontext.yaml up -d --build
+#
+# 前提：Dify 已按 ../运行说明.md 启动，存在 docker_default 网络。
+# Dify 工作流里的 HTTP 节点使用 http://powercontext:8000 访问本服务。
+
+services:
+  powercontext:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wangchuan/powercontext:1.2.0
+    container_name: powercontext
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 用命名卷保存 SQLite 文件，容器重建后记忆不丢（验证样例依赖跨会话记忆）
+      - powercontext-data:/data
+    networks:
+      - dify
+
+volumes:
+  powercontext-data:
+
+networks:
+  dify:
+    external: true
+    name: docker_default

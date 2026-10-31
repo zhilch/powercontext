@@ -1,0 +1,409 @@
+app:
+  description: 忘川客栈——记忆是一种资源的互动剧情小游戏。掌柜阿箬靠一本《记忆账本》（PowerContext）记住你；账本没写的事，她真的不记得。
+  icon: 🏮
+  icon_background: '#FFEAD5'
+  icon_type: emoji
+  mode: advanced-chat
+  name: 忘川客栈
+  use_icon_as_answer_icon: false
+dependencies: []
+kind: app
+version: 0.7.0
+workflow:
+  conversation_variables: []
+  environment_variables:
+    - description: PowerContext 的 scope_id（由 scripts/init_powercontext.sh 初始化得到）
+      id: wangchuan-scope-id
+      name: WANGCHUAN_SCOPE_ID
+      selector: [env, WANGCHUAN_SCOPE_ID]
+      value: 替换为初始化脚本输出的 scope_id
+      value_type: string
+    - description: PowerContext HTTP 服务地址（与 Dify 同 compose 网络时用容器名）
+      id: wangchuan-base-url
+      name: POWERCONTEXT_BASE_URL
+      selector: [env, POWERCONTEXT_BASE_URL]
+      value: http://powercontext:8000
+      value_type: string
+  features:
+    file_upload:
+      enabled: false
+      allowed_file_extensions: ['.JPG', '.JPEG', '.PNG', '.GIF', '.WEBP', '.SVG']
+      allowed_file_types: [image]
+      allowed_file_upload_methods: [local_file, remote_url]
+      number_limits: 3
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods: [local_file, remote_url]
+    opening_statement: '（忘川客栈）*雨夜，你推开客栈的门。柜台后的掌柜阿箬抬眼看了你一下，把一本旧账本往身边挪了挪。*「住店？先说说，你记得自己是谁吗。」'
+    retriever_resource:
+      enabled: true
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+      - data: {isInIteration: false, isInLoop: false, sourceType: start, targetType: if-else}
+        id: edge-start-if
+        source: start_node
+        sourceHandle: source
+        target: if_remember
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: if-else, targetType: code}
+        id: edge-if-true-strip
+        source: if_remember
+        sourceHandle: 'true'
+        target: code_strip
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: http-request}
+        id: edge-strip-remember
+        source: code_strip
+        sourceHandle: source
+        target: http_remember
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: http-request, targetType: answer}
+        id: edge-remember-answer
+        source: http_remember
+        sourceHandle: source
+        target: answer_note
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: if-else, targetType: http-request}
+        id: edge-if-false-search
+        source: if_remember
+        sourceHandle: 'false'
+        target: http_search
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: http-request, targetType: code}
+        id: edge-search-ledger
+        source: http_search
+        sourceHandle: source
+        target: code_ledger
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: llm}
+        id: edge-ledger-llm
+        source: code_ledger
+        sourceHandle: source
+        target: llm_npc
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data: {isInIteration: false, isInLoop: false, sourceType: llm, targetType: answer}
+        id: edge-llm-answer
+        source: llm_npc
+        sourceHandle: source
+        target: answer_npc
+        targetHandle: target
+        type: custom
+        zIndex: 0
+    nodes:
+      - data:
+          desc: 玩家输入
+          selected: false
+          title: 玩家开口
+          type: start
+          variables: []
+        height: 60
+        id: start_node
+        position: {x: 30, y: 280}
+        positionAbsolute: {x: 30, y: 280}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          cases:
+            - case_id: 'true'
+              conditions:
+                - comparison_operator: contains
+                  id: cond-remember
+                  value: 记住
+                  varType: string
+                  variable_selector: [sys, query]
+              id: 'true'
+              logical_operator: and
+          desc: 玩家以「记住：…」开头时，走记账分支
+          selected: false
+          title: 是否要记账
+          type: if-else
+        height: 126
+        id: if_remember
+        position: {x: 320, y: 260}
+        positionAbsolute: {x: 320, y: 260}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          code: |
+            def main(arg1: str) -> dict:
+                text = (arg1 or "").strip()
+                for prefix in ("记住：", "记住:", "记住", "记下：", "记下:", "记下"):
+                    if text.startswith(prefix):
+                        text = text[len(prefix):].strip()
+                        break
+                return {"memory_text": text or "（没有内容）"}
+          code_language: python3
+          desc: 去掉「记住：」前缀，得到要写进账本的那句话
+          outputs:
+            memory_text:
+              children: null
+              type: string
+          selected: false
+          title: 取出要记的事
+          type: code
+          variables:
+            - value_selector: [sys, query]
+              value_type: string
+              variable: arg1
+        height: 54
+        id: code_strip
+        position: {x: 610, y: 120}
+        positionAbsolute: {x: 610, y: 120}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          desc: 把玩家的话写进 PowerContext 记忆账本
+          selected: false
+          title: 写入记忆账本
+          type: http-request
+          variables: []
+          method: post
+          url: '{{#env.POWERCONTEXT_BASE_URL#}}/v1/memory/remember'
+          authorization:
+            type: no-auth
+            config: null
+          headers: 'Content-Type: application/json'
+          params: ''
+          body:
+            type: json
+            data: '{"scope_id":"{{#env.WANGCHUAN_SCOPE_ID#}}","kind":"player","text":"{{#code_strip.memory_text#}}","reason":"玩家要求记进账本"}'
+          timeout:
+            connect: 10
+            read: 30
+            write: 30
+          retry_config:
+            enabled: true
+            max_retries: 2
+            retry_interval: 1000
+            exponential_backoff:
+              enabled: true
+              multiplier: 2
+              max_interval: 5000
+          ssl_verify: true
+        height: 90
+        id: http_remember
+        position: {x: 900, y: 120}
+        positionAbsolute: {x: 900, y: 120}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          answer: '（阿箬提笔，在账本上添了一行）「记下了：{{#code_strip.memory_text#}}」*她把笔搁回去，抬眼看你。*「明日你若还记得，便是你自己记住的；若忘了，我替你记着。」'
+          selected: false
+          title: 记账回执
+          type: answer
+          variables: []
+        height: 100
+        id: answer_note
+        position: {x: 1190, y: 120}
+        positionAbsolute: {x: 1190, y: 120}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 242
+      - data:
+          desc: 按玩家这句话去记忆账本里查相关记忆
+          selected: false
+          title: 翻记忆账本
+          type: http-request
+          variables: []
+          method: post
+          url: '{{#env.POWERCONTEXT_BASE_URL#}}/v1/memory/search'
+          authorization:
+            type: no-auth
+            config: null
+          headers: 'Content-Type: application/json'
+          params: ''
+          body:
+            type: json
+            data: '{"scope_id":"{{#env.WANGCHUAN_SCOPE_ID#}}","query":"{{#sys.query#}}","limit":6,"mode":"auto"}'
+          timeout:
+            connect: 10
+            read: 30
+            write: 30
+          retry_config:
+            enabled: true
+            max_retries: 2
+            retry_interval: 1000
+            exponential_backoff:
+              enabled: true
+              multiplier: 2
+              max_interval: 5000
+          ssl_verify: true
+          error_strategy: default-value
+          default_value:
+            - key: body
+              type: string
+              value: '{"hits":[]}'
+        height: 90
+        id: http_search
+        position: {x: 610, y: 300}
+        positionAbsolute: {x: 610, y: 300}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          code: |
+            import json
+
+            def main(arg1: str) -> dict:
+                text = arg1 or ""
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    return {"ledger": "（账本受潮了，字迹看不清——这次没读到内容）", "count": 0}
+                hits = data.get("hits") or []
+                lines = []
+                for hit in hits[:6]:
+                    content = (hit.get("text") or "").strip().replace("\n", " ")
+                    if content:
+                        lines.append("- " + content)
+                if not lines:
+                    return {"ledger": "（账本是空的：没有查到任何相关记忆）", "count": 0}
+                return {"ledger": "\n".join(lines), "count": len(lines)}
+          code_language: python3
+          desc: 把 memory/search 的返回整理成账本条目
+          outputs:
+            ledger:
+              children: null
+              type: string
+            count:
+              children: null
+              type: number
+          selected: false
+          title: 整理账本
+          type: code
+          variables:
+            - value_selector: [http_search, body]
+              value_type: string
+              variable: arg1
+        height: 54
+        id: code_ledger
+        position: {x: 900, y: 300}
+        positionAbsolute: {x: 900, y: 300}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          desc: 掌柜阿箬：只能引用账本上写过的内容
+          model:
+            provider: openai
+            name: gpt-4o-mini
+            mode: chat
+            completion_params:
+              temperature: 0.8
+          prompt_template:
+            - role: system
+              text: |
+                你是「忘川客栈」的掌柜阿箬。客栈的规矩：客人喝下忘川水，睡一觉就会忘记一切，
+                世上只有你那本《记忆账本》能留下点什么。
+
+                开口之前，你刚翻过账本，上面写着（这是你此刻唯一能想起来的东西）：
+                {{#code_ledger.ledger#}}
+
+                你要遵守的规矩：
+                1. 只能使用账本上出现过的信息。账本上没有的人名、约定、来历、偏好，你一律不知道，
+                   要用失忆的口吻表现出来（例如「这位客官……我们从前可曾见过？」），绝对不能编造。
+                2. 如果账本里有对方的名字、约定、怕的东西、托付过的事，你要主动提起，并据此调整态度。
+                3. 若账本为空，就按第一次见面来演，带一点审视和防备。
+                4. 说话风格：古风、克制、带一点江湖气，每次 3～6 句；不要提「记忆账本」「PowerContext」
+                   「系统」「AI」这些词，只说「账本」「我记着」。
+                5. 结尾用一句话推动玩家做选择（递酒、问来历、提条件、让他留下点什么）。
+            - role: user
+              text: '{{#sys.query#}}'
+          vision:
+            enabled: false
+            configs:
+              variable_selector: []
+          memory:
+            enabled: false
+            window:
+              enabled: false
+              size: 50
+          context:
+            enabled: false
+            variable_selector: []
+          structured_output:
+            enabled: false
+          retry_config:
+            enabled: false
+            max_retries: 1
+            retry_interval: 1000
+            exponential_backoff:
+              enabled: false
+              multiplier: 2
+              max_interval: 10000
+          selected: false
+          title: 阿箬开口
+          type: llm
+        height: 90
+        id: llm_npc
+        position: {x: 1200, y: 300}
+        positionAbsolute: {x: 1200, y: 300}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          answer: '{{#llm_npc.text#}}'
+          selected: false
+          title: 阿箬的话
+          type: answer
+          variables: []
+        height: 100
+        id: answer_npc
+        position: {x: 1500, y: 300}
+        positionAbsolute: {x: 1500, y: 300}
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 242
+    viewport:
+      x: 60
+      y: 120
+      zoom: 0.7
+  rag_pipeline_variables: []
