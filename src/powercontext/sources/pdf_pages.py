@@ -96,16 +96,12 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
                 raise ValueError("PDF requires a user password")
         pages: list[PDFPageInput] = []
         for number, page in enumerate(reader.pages, start=1):
-            try:
-                text = page.extract_text() or ""
-            except Exception as error:
-                raise ValueError("PDF page text extraction failed") from error
             pages.append(
                 PDFPageInput(
                     document_id=document_id,
                     document_sha256=digest,
                     page_number=number,
-                    text=text,
+                    text=_page_text(page),
                 )
             )
     except ValueError:
@@ -115,6 +111,31 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     if not pages:
         raise ValueError("PDF document has no pages")
     return tuple(pages)
+
+
+def _page_text(page: object) -> str:
+    """Extract one page's text, falling back to the layout pass.
+
+    A single page whose content stream defeats the default extraction must not
+    discard the other pages of an otherwise readable filing: the layout pass
+    reads the same text with a different strategy and is tried before the page
+    is reported as empty. A document whose page tree cannot be walked at all
+    still fails as a whole, because that is a broken file rather than one
+    unreadable page.
+    """
+
+    extract = getattr(page, "extract_text", None)
+    if extract is None:
+        raise ValueError("PDF page has no text extractor")
+    try:
+        text = extract()
+    except Exception:  # noqa: BLE001 - the fallback below is the contract
+        try:
+            text = extract(extraction_mode="layout")
+        except Exception as error:  # noqa: BLE001 - an unreadable page stays empty
+            del error
+            return ""
+    return text or ""
 
 
 class PDFPageSourceAdapter:
@@ -208,6 +229,11 @@ async def search_pdf_pages(memory: object, question: str, limit: int = 10) -> tu
                 break
             fused[index] = fused.get(index, 0.0) + 1.0 / (_FUSION_RRF_CONSTANT + rank)
     fused = _with_document_identity(question, records, fused)
+    for terms, repetitions in _corpus_readings(records, analyzed, readings[0][0], fused):
+        for rank, index in enumerate(_rank_pages(analyzed, terms, repetitions), start=1):
+            if rank > _FUSION_DEPTH:
+                break
+            fused[index] = fused.get(index, 0.0) + 1.0 / (_FUSION_RRF_CONSTANT + rank)
     ordered = sorted(fused, key=lambda index: (-fused[index], index))
     ordered = _with_statement_pages(question, records, titles, ordered, limit)
     return tuple(
@@ -277,6 +303,11 @@ _STATEMENT_TITLE = re.compile(
 )
 _STATEMENT_RESERVE = 5
 _DOCUMENT_WEIGHT = 0.3
+_EXPANSION_WEIGHT = 0.15
+_EXPANSION_TERMS = 8
+_EXPANSION_SEED_PAGES = 30
+_EXPANSION_MIN_PAIR = 2
+_SENTENCE = re.compile(r"[^.!?\n]+")
 _NAME_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 
@@ -307,6 +338,55 @@ def _statement_indexes(
         if len(found) >= limit:
             break
     return found
+
+
+def _corpus_readings(
+    records: Sequence[object],
+    analyzed: Sequence[tuple[tuple[str, ...], tuple[str, ...]]],
+    terms: Sequence[str],
+    fused: dict[int, float],
+) -> tuple[tuple[tuple[str, ...], dict[str, float]], ...]:
+    """Return one extra reading built from terms the filing itself associates.
+
+    A question asks about ``gross margin`` while the page that answers it says
+    ``cost of sales`` and ``gross profit``, and no fixed synonym list can close
+    that gap for every filer. The pages that already scored best define the
+    document's own phrasing for these terms, so their sentences supply the
+    expansion; the added terms are down-weighted so they can only break ties in
+    the original ranking.
+    """
+
+    if not terms or not fused:
+        return ()
+    seeds = sorted(fused, key=lambda index: (-fused[index], index))[:_EXPANSION_SEED_PAGES]
+    wanted = frozenset(terms)
+    pair: dict[str, Counter[str]] = {}
+    popularity: Counter[str] = Counter()
+    for index in seeds:
+        body = _page_body(str(records[index].entry.text))
+        for sentence in _SENTENCE.findall(body):
+            tokens = {token for token in _TOKEN.findall(sentence.lower()) if len(token) > 2}
+            if not tokens:
+                continue
+            popularity.update(tokens)
+            for term in tokens & wanted:
+                bucket = pair.setdefault(term, Counter())
+                bucket.update(tokens - {term})
+    extra: list[str] = []
+    for term in terms:
+        neighbours = [
+            (other, count)
+            for other, count in pair.get(term, {}).items()
+            if count >= _EXPANSION_MIN_PAIR and popularity[other] >= 5 and other not in wanted
+        ]
+        neighbours.sort(key=lambda item: (-item[1] / math.sqrt(popularity[item[0]]), -item[1], item[0]))
+        extra.extend(other for other, _count in neighbours[:_EXPANSION_TERMS])
+    if not extra:
+        return ()
+    expansion = tuple(dict.fromkeys(extra))
+    weights = {term: 1.0 for term in terms}
+    weights.update({term: _EXPANSION_WEIGHT for term in expansion})
+    return (((*terms, *expansion), weights),)
 
 
 def _with_document_identity(
