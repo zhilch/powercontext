@@ -1,0 +1,44 @@
+# 温故 · 复习教练（演示用 compose）
+#
+# 用法：
+#   cp .env.example .env      # 填 DEEPSEEK_API_KEY
+#   docker compose up -d --build
+#   打开 http://localhost:8080
+#
+# 首次启动后执行 `bash scripts/init_scope.sh` 创建记忆账本，把输出的
+# WENGGU_SCOPE_ID 写进 .env，再 `docker compose up -d app` 让应用生效。
+
+services:
+  powercontext:
+    build:
+      context: ./powercontext
+      dockerfile: Dockerfile
+    image: wenggu/powercontext:1.2.0
+    container_name: wenggu-powercontext
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - powercontext-data:/data
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wenggu/app:1.0.0
+    container_name: wenggu-app
+    restart: unless-stopped
+    depends_on:
+      - powercontext
+    ports:
+      - "8080:8080"
+    environment:
+      POWERCONTEXT_BASE_URL: http://powercontext:8000
+      POWERCONTEXT_SCOPE_ID: ${WENGGU_SCOPE_ID:-}
+      POWERCONTEXT_TOKEN: ${POWERCONTEXT_TOKEN:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+
+volumes:
+  powercontext-data:

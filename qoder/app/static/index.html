@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>温故 · 复习教练</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d2129;
+    --text: #e6e8ee;
+    --muted: #98a2b3;
+    --accent: #6ea8fe;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --line: #262b35;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 20px 28px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 20px; margin: 0; letter-spacing: 1px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  #health { margin-left: auto; font-size: 12px; color: var(--muted); }
+  #health .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 28px 64px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+  .tabs button {
+    background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+    padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
+  }
+  .tabs button.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
+  section { display: none; }
+  section.active { display: block; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--muted); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+  .pill.due { color: var(--warn); border-color: #4a3a14; background: #221c0c; }
+  .pill.fresh { color: var(--ok); border-color: #14361f; background: #0e2016; }
+  input, textarea {
+    width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font: inherit; font-size: 14px;
+  }
+  textarea { min-height: 96px; resize: vertical; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  button.primary {
+    background: var(--accent); color: #08101f; border: 0; border-radius: 8px;
+    padding: 10px 18px; font-weight: 600; cursor: pointer; font-size: 14px;
+  }
+  button.primary:disabled { opacity: .5; cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 13px;
+  }
+  .muted { color: var(--muted); font-size: 13px; }
+  .score { font-size: 34px; font-weight: 700; }
+  .feedback { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 12px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 12px 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .metric { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .metric .num { font-size: 26px; font-weight: 700; }
+  .metric .label { color: var(--muted); font-size: 12px; }
+  #toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background: #2b1d1d; color: #ffd7d7; border: 1px solid #5a2626;
+    padding: 10px 16px; border-radius: 10px; display: none; font-size: 14px; max-width: 80vw;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>温故</h1>
+  <span class="sub">复习教练 · 记得你哪里薄弱，下次先复习那里</span>
+  <span id="health"><span class="dot"></span>检查中…</span>
+</header>
+
+<main>
+  <div class="tabs">
+    <button data-tab="plan" class="active">今日复习</button>
+    <button data-tab="kps">知识点</button>
+    <button data-tab="stats">统计</button>
+  </div>
+
+  <section id="tab-plan" class="active">
+    <div class="card">
+      <h2>今天该复习这些</h2>
+      <div id="plan-list" class="empty">加载中…</div>
+    </div>
+    <div class="card" id="quiz-card" style="display:none">
+      <h2 id="quiz-title">开始复习</h2>
+      <p id="quiz-question" style="font-size:16px"></p>
+      <p class="muted" id="quiz-hint"></p>
+      <textarea id="quiz-answer" placeholder="用自己的话答一遍，不用写满，写出关键点即可"></textarea>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="quiz-submit">提交，让教练打分</button>
+        <button class="ghost" id="quiz-cancel">换一个</button>
+      </div>
+      <div id="quiz-result" style="display:none"></div>
+    </div>
+  </section>
+
+  <section id="tab-kps">
+    <div class="card">
+      <h2>添加知识点</h2>
+      <div class="row">
+        <input id="kp-subject" placeholder="学科，例如 高等数学" />
+        <input id="kp-topic" placeholder="知识点，例如 泰勒展开的余项形式" />
+      </div>
+      <div style="margin-top:12px">
+        <input id="kp-note" placeholder="备注（可留空）：你最容易错在哪里" />
+      </div>
+      <div style="margin-top:12px">
+        <button class="primary" id="kp-add">加入复习清单</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>全部知识点</h2>
+      <div id="kp-list" class="empty">加载中…</div>
+    </div>
+  </section>
+
+  <section id="tab-stats">
+    <div class="card">
+      <h2>学习概况</h2>
+      <div class="grid" id="stats-grid"></div>
+    </div>
+    <div class="card">
+      <h2>按学科</h2>
+      <div id="stats-subject" class="empty">加载中…</div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const state = { kps: [], quiz: null };
+
+function toast(message) {
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.style.display = "block";
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.display = "none"; }, 4200);
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+  if (!response.ok) {
+    const detail = (data && data.detail) || text || response.statusText;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return data;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[char]));
+}
+
+function dueLabel(days) {
+  if (days <= 0) return `<span class="pill due">该复习了（${Math.abs(days).toFixed(1)} 天前到期）</span>`;
+  return `<span class="pill fresh">${days.toFixed(1)} 天后复习</span>`;
+}
+
+async function refreshHealth() {
+  const el = document.getElementById("health");
+  try {
+    const data = await api("/api/health");
+    const ok = data.status === "ok";
+    el.innerHTML = `<span class="dot" style="background:${ok ? "var(--ok)" : "var(--bad)"}"></span>`
+      + (ok ? `记忆服务正常 · ${escapeHtml(data.model)}` : `记忆服务异常：${escapeHtml(data.detail)}`);
+  } catch (error) {
+    el.innerHTML = `<span class="dot" style="background:var(--bad)"></span>连接失败`;
+  }
+}
+
+async function refreshPlan() {
+  const box = document.getElementById("plan-list");
+  try {
+    const items = await api("/api/plan?limit=5");
+    if (!items.length) {
+      box.className = "empty";
+      box.textContent = "还没有知识点。先去「知识点」里加几条，再来复习。";
+      return;
+    }
+    box.className = "";
+    box.innerHTML = `<table><thead><tr><th>学科</th><th>知识点</th><th>掌握度</th><th>复习次数</th><th>状态</th><th></th></tr></thead><tbody>${
+      items.map((kp) => `<tr>
+        <td>${escapeHtml(kp.subject)}</td>
+        <td>${escapeHtml(kp.topic)}${kp.note ? `<div class="muted">上次薄弱：${escapeHtml(kp.note)}</div>` : ""}</td>
+        <td>${kp.score} / 5</td>
+        <td>${kp.reviews}</td>
+        <td>${dueLabel(kp.due_in_days)}</td>
+        <td><button class="ghost" data-quiz="${escapeHtml(kp.id)}">开始复习</button></td>
+      </tr>`).join("")
+    }</tbody></table>`;
+    box.querySelectorAll("[data-quiz]").forEach((button) => {
+      button.addEventListener("click", () => startQuiz(button.dataset.quiz));
+    });
+  } catch (error) {
+    box.className = "empty";
+    box.textContent = "读取复习清单失败：" + error.message;
+  }
+}
+
+async function refreshKps() {
+  const box = document.getElementById("kp-list");
+  try {
+    const items = await api("/api/kp");
+    state.kps = items;
+    if (!items.length) {
+      box.className = "empty";
+      box.textContent = "还没有知识点。";
+      return;
+    }
+    box.className = "";
+    box.innerHTML = `<table><thead><tr><th>学科</th><th>知识点</th><th>掌握度</th><th>复习次数</th><th>下次复习</th></tr></thead><tbody>${
+      items.map((kp) => `<tr>
+        <td>${escapeHtml(kp.subject)}</td>
+        <td>${escapeHtml(kp.topic)}</td>
+        <td>${kp.score} / 5</td>
+        <td>${kp.reviews}</td>
+        <td>${dueLabel(kp.due_in_days)}</td>
+      </tr>`).join("")
+    }</tbody></table>`;
+  } catch (error) {
+    box.className = "empty";
+    box.textContent = "读取知识点失败：" + error.message;
+  }
+}
+
+async function refreshStats() {
+  try {
+    const data = await api("/api/stats");
+    document.getElementById("stats-grid").innerHTML = [
+      ["知识点", data.total],
+      ["今天到期", data.due_today],
+      ["平均掌握度", data.avg_score + " / 5"],
+      ["累计复习", data.reviews + " 次"],
+    ].map(([label, value]) => `<div class="metric"><div class="num">${escapeHtml(value)}</div><div class="label">${label}</div></div>`).join("");
+    const subjects = Object.entries(data.by_subject || {});
+    const box = document.getElementById("stats-subject");
+    if (!subjects.length) {
+      box.className = "empty";
+      box.textContent = "还没有数据。";
+      return;
+    }
+    box.className = "";
+    box.innerHTML = `<table><thead><tr><th>学科</th><th>知识点数</th><th>平均掌握度</th><th>薄弱项（≤2 分）</th></tr></thead><tbody>${
+      subjects.map(([name, item]) => `<tr>
+        <td>${escapeHtml(name)}</td>
+        <td>${item.count}</td>
+        <td>${item.avg_score} / 5</td>
+        <td>${item.weak}</td>
+      </tr>`).join("")
+    }</tbody></table>`;
+  } catch (error) {
+    document.getElementById("stats-subject").textContent = "读取统计失败：" + error.message;
+  }
+}
+
+async function startQuiz(id) {
+  const card = document.getElementById("quiz-card");
+  const result = document.getElementById("quiz-result");
+  result.style.display = "none";
+  result.innerHTML = "";
+  document.getElementById("quiz-answer").value = "";
+  card.style.display = "block";
+  document.getElementById("quiz-title").textContent = "正在出题…";
+  document.getElementById("quiz-question").textContent = "";
+  document.getElementById("quiz-hint").textContent = "";
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  try {
+    const quiz = await api("/api/quiz", { method: "POST", body: JSON.stringify({ id }) });
+    state.quiz = quiz;
+    document.getElementById("quiz-title").textContent = `${quiz.subject} · ${quiz.topic}`;
+    document.getElementById("quiz-question").textContent = quiz.question;
+    document.getElementById("quiz-hint").textContent = quiz.hint ? "提示：" + quiz.hint : "";
+  } catch (error) {
+    document.getElementById("quiz-title").textContent = "出题失败";
+    toast(error.message);
+  }
+}
+
+async function submitQuiz() {
+  if (!state.quiz) return;
+  const answer = document.getElementById("quiz-answer").value.trim();
+  if (answer.length < 2) { toast("先写点答案再提交"); return; }
+  const button = document.getElementById("quiz-submit");
+  button.disabled = true;
+  button.textContent = "评分中…";
+  try {
+    const grade = await api("/api/grade", {
+      method: "POST",
+      body: JSON.stringify({
+        id: state.quiz.id,
+        question: state.quiz.question,
+        reference: state.quiz.reference,
+        answer,
+      }),
+    });
+    const box = document.getElementById("quiz-result");
+    box.style.display = "block";
+    box.innerHTML = `
+      <div class="feedback">
+        <div class="score" style="color:${grade.score >= 4 ? "var(--ok)" : grade.score >= 3 ? "var(--warn)" : "var(--bad)"}">${grade.score} / 5</div>
+        <p>${escapeHtml(grade.feedback)}</p>
+        ${grade.error_note ? `<p class="muted">记进账本的薄弱点：${escapeHtml(grade.error_note)}</p>` : ""}
+        <p class="muted">下次复习：${escapeHtml(grade.next_review)}</p>
+      </div>`;
+    refreshPlan();
+    refreshKps();
+    refreshStats();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "提交，让教练打分";
+  }
+}
+
+document.getElementById("kp-add").addEventListener("click", async () => {
+  const subject = document.getElementById("kp-subject").value.trim();
+  const topic = document.getElementById("kp-topic").value.trim();
+  const note = document.getElementById("kp-note").value.trim();
+  if (!subject || !topic) { toast("学科和知识点都要填"); return; }
+  try {
+    await api("/api/kp", { method: "POST", body: JSON.stringify({ subject, topic, note }) });
+    document.getElementById("kp-topic").value = "";
+    document.getElementById("kp-note").value = "";
+    toast("已加入复习清单");
+    refreshKps(); refreshPlan(); refreshStats();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+document.getElementById("quiz-submit").addEventListener("click", submitQuiz);
+document.getElementById("quiz-cancel").addEventListener("click", () => {
+  document.getElementById("quiz-card").style.display = "none";
+  state.quiz = null;
+});
+
+document.querySelectorAll(".tabs button").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((item) => item.classList.remove("active"));
+    document.querySelectorAll("section").forEach((item) => item.classList.remove("active"));
+    button.classList.add("active");
+    document.getElementById("tab-" + button.dataset.tab).classList.add("active");
+    if (button.dataset.tab === "stats") refreshStats();
+    if (button.dataset.tab === "kps") refreshKps();
+    if (button.dataset.tab === "plan") refreshPlan();
+  });
+});
+
+refreshHealth();
+refreshPlan();
+refreshKps();
+refreshStats();
+</script>
+</body>
+</html>
